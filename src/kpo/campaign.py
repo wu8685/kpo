@@ -35,6 +35,13 @@ from kpo.evaluator_agreement import (
     persist_agreement_checkpoint,
     persist_agreement_report,
 )
+from kpo.evaluator_audit_runtime import (
+    EvaluatorAuditBudgetError,
+    EvaluatorCalibrationCheckpointError,
+    cleanup_calibration_checkpoint,
+    run_evaluator_calibration,
+)
+from kpo.evaluator_calibration_report import EvaluatorCalibrationPersistenceError
 from kpo.models import (
     Diagnosis,
     Evaluation,
@@ -363,6 +370,39 @@ def run_campaign(
             "sandbox": profile.sandbox_type,
         }
         _atomic_json(path, state)
+
+    if profile.evaluator_audit is not None:
+        try:
+            calibration_binding = run_evaluator_calibration(
+                profile,
+                campaign_id,
+                profile_snapshot_digest=snapshot_digest,
+                integrity_monitor=monitor,
+            )
+        except FileNotFoundError:
+            state.update(
+                state="failed",
+                failure_kind="evaluator_calibration_approval",
+            )
+            _atomic_json(path, state)
+            return state
+        except (EvaluatorCalibrationCheckpointError, EvaluatorAuditBudgetError):
+            state.update(
+                state="failed",
+                failure_kind="evaluator_calibration_checkpoint",
+            )
+            _atomic_json(path, state)
+            return state
+        except EvaluatorCalibrationPersistenceError:
+            state.update(
+                state="failed",
+                failure_kind="evaluator_calibration_persistence",
+            )
+            _atomic_json(path, state)
+            return state
+        state.update(**calibration_binding)
+        _atomic_json(path, state)
+        cleanup_calibration_checkpoint(profile.base.data_home, campaign_id)
 
     executor = CampaignCallExecutor(
         profile.base.data_home,

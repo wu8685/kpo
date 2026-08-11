@@ -1,8 +1,8 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.6 development milestone. KPO can measure disagreement among
-> independent Evaluators, bind that evidence to reviewable promotion
-> transactions, and explicitly apply or recover approved policy updates.
+> Status: v0.7 development milestone. KPO can measure Evaluator agreement,
+> calibration against approved synthetic anchors, and cross-campaign drift
+> while keeping all measurement evidence outside the repository.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -100,6 +100,16 @@ operation with an allowlist, diff, snapshot, and journal.
   metrics, including explicit partial evidence when the global budget ends;
 - strict external agreement reports and promotion bundle v2 approval that
   binds the exact audit-report bytes;
+- optional, explicitly approved synthetic anchor sets for measuring each
+  Evaluator against a stable scoring contract without invoking the Actor;
+- fresh per-campaign anchor replay under a separate finite budget, with
+  crash-safe at-most-once checkpoints and explicit unavailable evidence;
+- deterministic signed-error, absolute-error, RMS-error, population-deviation,
+  and maximum-error calibration metrics;
+- aggregate calibration reports separated from digest-bound private
+  per-anchor observations;
+- read-only cross-campaign Evaluator drift comparison using the target
+  campaign's historical thresholds rather than the current profile;
 - byte-exact source and target integrity checks that avoid hashing the same
   physical file twice within one verification pass.
 
@@ -195,6 +205,58 @@ uv run kpo evaluator-agreement \
   --campaign CAMPAIGN_ID
 ```
 
+## Audit Evaluator calibration and drift
+
+Calibration anchors are synthetic fixed rollouts with selected references and
+human-reviewed expected rubric scores. They live in the external profile, not
+in this repository. KPO validates their structure and bytes, but it does not
+decide whether real expected scores are semantically correct.
+
+An optional campaign profile section enables the audit:
+
+```toml
+[evaluator_audit]
+anchor_manifest = "./anchors.jsonl"
+max_provider_calls = 100
+
+[evaluator_audit.drift_thresholds]
+alignment = 0.10
+validity = 0.05
+```
+
+Approve the exact current anchor set before starting a campaign:
+
+```bash
+# Preview safe metadata and an approval digest. No anchor content or scores
+# are printed.
+uv run kpo anchors approve \
+  --profile /path/outside/kpo/profile.toml
+
+# Create the immutable approval record for exactly those reviewed bytes.
+uv run kpo anchors approve \
+  --profile /path/outside/kpo/profile.toml \
+  --approve APPROVAL_DIGEST
+```
+
+Each new campaign freshly replays the fixed rollouts through the primary and
+observer Evaluators. Audit calls use their own budget and never enter policy
+diagnosis, Proposer input, gates, candidate selection, or promotion approval.
+Provider failures remain visible as missing measurement evidence.
+
+Compare two completed audit records without making Provider calls:
+
+```bash
+uv run kpo evaluator-drift \
+  --profile /path/outside/kpo/profile.toml \
+  --baseline BASELINE_CAMPAIGN_ID \
+  --target TARGET_CAMPAIGN_ID
+```
+
+The command reports aggregate matched-anchor score changes, configuration
+changes, missing evidence, and whether a change strictly exceeds the threshold
+stored by the target campaign. It never prints per-anchor digests, expected
+scores, or raw Evaluator scores.
+
 Dataset expansion follows the same preview/approval rule:
 
 ```bash
@@ -266,3 +328,4 @@ Approved specifications:
 - [v0.4 exact integrity deduplication](docs/specs/0004-exact-integrity-deduplication.md)
 - [v0.5 external promotion and chaining](docs/specs/0005-external-promotion-and-chaining.md)
 - [v0.6 Evaluator agreement audit](docs/specs/0006-evaluator-agreement-audit.md)
+- [v0.7 Evaluator calibration and drift](docs/specs/0007-evaluator-calibration-and-drift.md)

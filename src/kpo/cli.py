@@ -16,6 +16,11 @@ from kpo.external_promotion import (
     recover_campaign_promotion,
 )
 from kpo.evaluator_agreement import load_agreement_report
+from kpo.evaluator_calibration import (
+    apply_anchor_approval,
+    preview_anchor_approval,
+)
+from kpo.evaluator_drift import compare_profile_evaluator_drift
 from kpo.hygiene import scan_repository
 from kpo.profile import load_profile
 from kpo.runner import evaluate_profile_run, profile_summary, run_profile, run_status
@@ -72,6 +77,13 @@ def _parser() -> argparse.ArgumentParser:
     dataset_grow.add_argument("--approve")
     dataset_grow.add_argument("--checkout", type=Path, default=Path.cwd())
 
+    anchors = subcommands.add_parser("anchors", help="manage evaluator anchor sets")
+    anchor_commands = anchors.add_subparsers(dest="anchor_command", required=True)
+    anchor_approve = anchor_commands.add_parser("approve")
+    anchor_approve.add_argument("--profile", type=Path, required=True)
+    anchor_approve.add_argument("--approve")
+    anchor_approve.add_argument("--checkout", type=Path, default=Path.cwd())
+
     campaign = subcommands.add_parser("campaign", help="run an optimization campaign")
     campaign.add_argument("--profile", type=Path, required=True)
     campaign.add_argument("--resume")
@@ -88,6 +100,13 @@ def _parser() -> argparse.ArgumentParser:
     agreement.add_argument("--profile", type=Path, required=True)
     agreement.add_argument("--campaign", required=True)
     agreement.add_argument("--checkout", type=Path, default=Path.cwd())
+    drift = subcommands.add_parser(
+        "evaluator-drift", help="compare evaluator calibration across campaigns"
+    )
+    drift.add_argument("--profile", type=Path, required=True)
+    drift.add_argument("--baseline", required=True)
+    drift.add_argument("--target", required=True)
+    drift.add_argument("--checkout", type=Path, default=Path.cwd())
     promote = subcommands.add_parser(
         "promote", help="preview, apply, or recover a campaign promotion"
     )
@@ -130,6 +149,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 1 if violations else 0
+    if args.command == "anchors":
+        if args.anchor_command != "approve":
+            raise AssertionError(f"unhandled anchor command: {args.anchor_command}")
+        if args.approve is None:
+            result = preview_anchor_approval(
+                args.profile, checkout=args.checkout
+            )
+        else:
+            result = apply_anchor_approval(
+                args.profile,
+                checkout=args.checkout,
+                approval_digest=args.approve,
+            )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     if args.command == "dataset":
         if args.dataset_command == "init":
             result = initialize_campaign_dataset(
@@ -198,6 +232,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "evaluator-agreement":
         profile = load_campaign_profile(args.profile, checkout=args.checkout)
         result = load_agreement_report(profile, args.campaign)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.command == "evaluator-drift":
+        profile = load_campaign_profile(args.profile, checkout=args.checkout)
+        result = compare_profile_evaluator_drift(
+            profile,
+            args.baseline,
+            args.target,
+        )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
     if args.command == "promote":

@@ -59,6 +59,7 @@ class ExternalProfile:
     policy: PolicySnapshot
     cases: Mapping[str, TaskCase]
     references: Mapping[str, ReferenceArtifact]
+    reference_source_digests: Mapping[str, str]
     rubric: Rubric
     actor: CommandProviderConfig
     evaluator: CommandProviderConfig
@@ -188,6 +189,7 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
             "actor",
             "evaluator",
             "observer_evaluators",
+            "evaluator_audit",
             "dataset",
             "proposer",
             "campaign",
@@ -268,6 +270,7 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
         )
 
     references: dict[str, ReferenceArtifact] = {}
+    reference_source_digests: dict[str, str] = {}
     for record in _read_jsonl(
         section_paths["references"], label="reference manifest"
     ):
@@ -277,10 +280,19 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
             raise ValueError(f"duplicate reference artifact_id: {artifact_id}")
         content_path = _source_path(root, item.get("path"), label="reference.path")
         source_paths.add(content_path)
+        content_bytes = content_path.read_bytes()
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError("reference.path must contain UTF-8") from error
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        reference_source_digests[artifact_id] = hashlib.sha256(
+            content_bytes
+        ).hexdigest()
         references[artifact_id] = ReferenceArtifact(
             artifact_id=artifact_id,
             kind=_require_string(item.get("kind"), label="reference.kind"),
-            content=content_path.read_text(encoding="utf-8"),
+            content=content,
         )
     missing = {
         reference_id
@@ -414,6 +426,7 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
         policy=PolicySnapshot.from_artifacts(tuple(policy_artifacts)),
         cases=MappingProxyType(cases),
         references=MappingProxyType(references),
+        reference_source_digests=MappingProxyType(reference_source_digests),
         rubric=Rubric(
             rubric_version=_require_string(
                 rubric_data.get("rubric_version"), label="rubric_version"

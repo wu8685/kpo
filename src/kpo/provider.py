@@ -228,41 +228,44 @@ class CommandEvaluatorProvider:
         self.context = context or {}
 
     def evaluate(self, request: EvaluatorRequest) -> EvaluatorResult:
+        request_value = {
+            "case_id": request.case_id,
+            "rollout": {
+                "case_id": request.rollout.case_id,
+                "policy_digest": request.rollout.policy_digest,
+                "model_id": request.rollout.model_id,
+                "output": request.rollout.output,
+                "retrieved_policy_ids": request.rollout.retrieved_policy_ids,
+                "actor_payload_digest": request.rollout.actor_payload_digest,
+                "digest": request.rollout.digest,
+            },
+            "references": [
+                {
+                    "artifact_id": reference.artifact_id,
+                    "kind": reference.kind,
+                    "content": reference.content,
+                }
+                for reference in request.references
+            ],
+            "rubric": {
+                "rubric_version": self.rubric.rubric_version,
+                "dimensions": [
+                    {
+                        "name": dimension.name,
+                        "description": dimension.description,
+                        "weight": dimension.weight,
+                    }
+                    for dimension in self.rubric.dimensions
+                ],
+            },
+            "evaluator_id": self.config.identity,
+        }
+        if request.random_seed is not None:
+            request_value["random_seed"] = request.random_seed
         value = _dispatch(
             self.config,
             "evaluator",
-            {
-                "case_id": request.case_id,
-                "rollout": {
-                    "case_id": request.rollout.case_id,
-                    "policy_digest": request.rollout.policy_digest,
-                    "model_id": request.rollout.model_id,
-                    "output": request.rollout.output,
-                    "retrieved_policy_ids": request.rollout.retrieved_policy_ids,
-                    "actor_payload_digest": request.rollout.actor_payload_digest,
-                    "digest": request.rollout.digest,
-                },
-                "references": [
-                    {
-                        "artifact_id": reference.artifact_id,
-                        "kind": reference.kind,
-                        "content": reference.content,
-                    }
-                    for reference in request.references
-                ],
-                "rubric": {
-                    "rubric_version": self.rubric.rubric_version,
-                    "dimensions": [
-                        {
-                            "name": dimension.name,
-                            "description": dimension.description,
-                            "weight": dimension.weight,
-                        }
-                        for dimension in self.rubric.dimensions
-                    ],
-                },
-                "evaluator_id": self.config.identity,
-            },
+            request_value,
             self.executor,
             self.context,
         )

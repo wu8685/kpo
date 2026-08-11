@@ -33,6 +33,7 @@ class EvaluatorRequest:
     rollout: Rollout
     references: tuple[ReferenceArtifact, ...]
     rubric_version: str
+    random_seed: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

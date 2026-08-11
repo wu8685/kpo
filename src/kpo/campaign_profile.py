@@ -13,6 +13,7 @@ from typing import Mapping
 
 from kpo.dataset import DatasetManifest, load_dataset
 from kpo.digest import canonical_digest
+from kpo.evaluator_calibration import EvaluatorAuditConfig, load_evaluator_audit
 from kpo.integrity import IntegrityMonitor
 from kpo.models import CandidatePatch, MutationKind
 from kpo.profile import (
@@ -46,6 +47,7 @@ class CampaignProfile:
     policy_paths: Mapping[str, str]
     policy_manifest_path: Path
     sandbox_type: str
+    evaluator_audit: EvaluatorAuditConfig | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,37 +64,46 @@ def validate_campaign_id(value: str) -> str:
 
 def campaign_profile_snapshot(profile: CampaignProfile) -> str:
     commands = (profile.base.actor, profile.base.evaluator, profile.proposer)
-    return canonical_digest(
-        {
-            "profile_sources": profile.base.source_digests,
-            "dataset_digest": profile.dataset.digest,
-            "commands": [
-                {
-                    "config": command,
-                    "executable_digest": hashlib.sha256(
-                        Path(command.command[0]).read_bytes()
-                    ).hexdigest(),
-                }
-                for command in commands
-            ],
-            "observers": [
-                {
-                    "name": observer.name,
-                    "config": observer.config,
-                    "executable_digest": hashlib.sha256(
-                        Path(observer.config.command[0]).read_bytes()
-                    ).hexdigest(),
-                }
-                for observer in profile.base.observer_evaluators
-            ],
-            "gates": profile.gates,
-            "promotion": {
-                "target_root": profile.target_root,
-                "allowlist": profile.allowlist,
-                "add_directory": profile.add_directory,
-            },
+    snapshot = {
+        "profile_sources": profile.base.source_digests,
+        "dataset_digest": profile.dataset.digest,
+        "commands": [
+            {
+                "config": command,
+                "executable_digest": hashlib.sha256(
+                    Path(command.command[0]).read_bytes()
+                ).hexdigest(),
+            }
+            for command in commands
+        ],
+        "observers": [
+            {
+                "name": observer.name,
+                "config": observer.config,
+                "executable_digest": hashlib.sha256(
+                    Path(observer.config.command[0]).read_bytes()
+                ).hexdigest(),
+            }
+            for observer in profile.base.observer_evaluators
+        ],
+        "gates": profile.gates,
+        "promotion": {
+            "target_root": profile.target_root,
+            "allowlist": profile.allowlist,
+            "add_directory": profile.add_directory,
+        },
+    }
+    if profile.evaluator_audit is not None:
+        snapshot["evaluator_audit"] = {
+            "anchor_set_digest": profile.evaluator_audit.anchor_set_digest,
+            "anchor_request_set_digest": (
+                profile.evaluator_audit.anchor_request_set_digest
+            ),
+            "max_provider_calls": profile.evaluator_audit.max_provider_calls,
+            "drift_thresholds": profile.evaluator_audit.drift_thresholds,
+            "source_digests": profile.evaluator_audit.source_digests,
         }
-    )
+    return canonical_digest(snapshot)
 
 
 def campaign_integrity_monitor(profile: CampaignProfile) -> IntegrityMonitor:
@@ -107,6 +118,14 @@ def campaign_integrity_monitor(profile: CampaignProfile) -> IntegrityMonitor:
             *(
                 Path(observer.config.command[0])
                 for observer in profile.base.observer_evaluators
+            ),
+            *(
+                ()
+                if profile.evaluator_audit is None
+                else (
+                    profile.evaluator_audit.manifest_path,
+                    *(anchor.rollout_path for anchor in profile.evaluator_audit.anchors),
+                )
             ),
         ),
         target_root=profile.target_root,
@@ -238,6 +257,9 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         raise ValueError("sandbox.type is invalid")
     if sandbox_type != "none":
         raise ValueError(f"sandbox type {sandbox_type} is unavailable in v0.3")
+    evaluator_audit = load_evaluator_audit(
+        raw.get("evaluator_audit"), profile=base
+    )
     return CampaignProfile(
         base=base,
         dataset=dataset,
@@ -255,6 +277,7 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         policy_paths=MappingProxyType(policy_paths),
         policy_manifest_path=policy_manifest,
         sandbox_type=sandbox_type,
+        evaluator_audit=evaluator_audit,
     )
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from kpo.campaign import campaign_status, initialize_campaign_dataset, run_campaign
 from kpo.campaign_profile import load_campaign_profile
 from kpo.campaign_series import (
+    generalize_series,
     initialize_series,
     reconcile_series,
     series_evidence_report,
@@ -30,6 +31,7 @@ from kpo.external_promotion import (
     recover_campaign_promotion,
 )
 from kpo.hygiene import scan_repository
+from kpo.generalization import load_generalization_manifest
 from kpo.profile import load_profile
 from kpo.runner import evaluate_profile_run, profile_summary, run_profile, run_status
 
@@ -100,7 +102,14 @@ def _parser() -> argparse.ArgumentParser:
 
     series = subcommands.add_parser("series", help="manage a campaign series")
     series_commands = series.add_subparsers(dest="series_command", required=True)
-    for name in ("init", "status", "evidence", "reconcile", "stop"):
+    for name in (
+        "init",
+        "status",
+        "evidence",
+        "reconcile",
+        "stop",
+        "generalize",
+    ):
         command = series_commands.add_parser(name)
         command.add_argument("--profile", type=Path, required=True)
         command.add_argument("--series", required=name != "init")
@@ -196,6 +205,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = reconcile_series(profile, series_id)
         elif args.series_command == "stop":
             result = stop_series(profile, series_id)
+        elif args.series_command == "generalize":
+            result = generalize_series(profile, series_id)
         else:
             raise AssertionError(f"unhandled series command: {args.series_command}")
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
@@ -223,6 +234,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             elif args.dataset_command == "grow":
                 proposed = load_dataset(args.inbox, profile.base.cases)
+                if profile.generalization is not None:
+                    load_generalization_manifest(
+                        profile.generalization.manifest.path,
+                        profile.base.cases,
+                        proposed,
+                    )
                 preview = manager.preview_growth(
                     profile.dataset,
                     proposed,

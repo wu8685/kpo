@@ -13,6 +13,7 @@ from types import MappingProxyType
 from kpo.dataset import DatasetManifest, load_dataset
 from kpo.digest import canonical_digest
 from kpo.evaluator_calibration import EvaluatorAuditConfig, load_evaluator_audit
+from kpo.generalization import GeneralizationManifest, load_generalization_manifest
 from kpo.integrity import IntegrityMonitor
 from kpo.models import CandidatePatch, MutationKind
 from kpo.profile import (
@@ -38,6 +39,12 @@ class SeriesConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GeneralizationConfig:
+    manifest: GeneralizationManifest
+    max_provider_calls: int
+
+
+@dataclass(frozen=True, slots=True)
 class CampaignProfile:
     base: ExternalProfile
     dataset: DatasetManifest
@@ -55,6 +62,7 @@ class CampaignProfile:
     sandbox_type: str
     evaluator_audit: EvaluatorAuditConfig | None
     series: SeriesConfig | None
+    generalization: GeneralizationConfig | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,9 +122,15 @@ def campaign_profile_snapshot(profile: CampaignProfile) -> str:
 
 
 def campaign_integrity_monitor(profile: CampaignProfile) -> IntegrityMonitor:
+    source_digests = dict(profile.base.source_digests)
+    if profile.generalization is not None:
+        relative = profile.generalization.manifest.path.relative_to(
+            profile.base.path.parent
+        ).as_posix()
+        source_digests[relative] = profile.generalization.manifest.source_digest
     return IntegrityMonitor.from_relative_digests(
         profile.base.path.parent,
-        profile.base.source_digests,
+        source_digests,
         extra_files=(
             profile.dataset_path,
             Path(profile.base.actor.command[0]),
@@ -160,7 +174,9 @@ def _unit_float(value: object, label: str) -> float:
 def _series_config(raw: object) -> SeriesConfig | None:
     if raw is None:
         return None
-    section = _strict(raw, {"max_campaigns", "stopping"}, label="series")
+    section = _strict(
+        raw, {"max_campaigns", "stopping", "generalization"}, label="series"
+    )
     stopping_raw = section.get("stopping")
     if stopping_raw is None:
         minimum = None
@@ -205,6 +221,42 @@ def _series_config(raw: object) -> SeriesConfig | None:
         min_improvement=minimum,
         patience=patience,
         holdout_degradation=degradation,
+    )
+
+
+def _generalization_config(
+    raw: object,
+    *,
+    root: Path,
+    base: ExternalProfile,
+    dataset: DatasetManifest,
+) -> GeneralizationConfig | None:
+    if raw is None:
+        return None
+    section = _strict(
+        raw, {"max_campaigns", "stopping", "generalization"}, label="series"
+    )
+    generalization_raw = section.get("generalization")
+    if generalization_raw is None:
+        return None
+    generalization = _strict(
+        generalization_raw,
+        {"manifest", "max_provider_calls"},
+        label="series.generalization",
+    )
+    manifest_path = _source_path(
+        root,
+        generalization.get("manifest"),
+        label="series.generalization.manifest",
+    )
+    return GeneralizationConfig(
+        manifest=load_generalization_manifest(
+            manifest_path, base.cases, dataset
+        ),
+        max_provider_calls=_positive_integer(
+            generalization.get("max_provider_calls"),
+            "series.generalization.max_provider_calls",
+        ),
     )
 
 
@@ -329,7 +381,11 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
     evaluator_audit = load_evaluator_audit(
         raw.get("evaluator_audit"), profile=base
     )
-    series = _series_config(raw.get("series"))
+    series_raw = raw.get("series")
+    series = _series_config(series_raw)
+    generalization = _generalization_config(
+        series_raw, root=root, base=base, dataset=dataset
+    )
     return CampaignProfile(
         base=base,
         dataset=dataset,
@@ -349,6 +405,7 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         sandbox_type=sandbox_type,
         evaluator_audit=evaluator_audit,
         series=series,
+        generalization=generalization,
     )
 
 

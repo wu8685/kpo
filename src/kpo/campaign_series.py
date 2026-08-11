@@ -12,11 +12,24 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from kpo.campaign_profile import CampaignProfile, validate_campaign_id
+from kpo.campaign_profile import (
+    CampaignProfile,
+    campaign_integrity_monitor,
+    validate_campaign_id,
+)
 from kpo.digest import canonical_digest, canonical_json
 from kpo.evaluator_agreement import load_agreement_report
 from kpo.evaluator_calibration_report import calibration_summary
-from kpo.models import Partition
+from kpo.integrity import IntegrityMonitor, IntegrityViolation
+from kpo.models import Partition, PolicyArtifact, PolicySnapshot
+from kpo.pipeline import evaluate_rollout, run_actor
+from kpo.provider import (
+    CommandActorProvider,
+    CommandEvaluatorProvider,
+    ProviderFailure,
+    ProviderFailureKind,
+    _invoke,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +66,13 @@ _SERIES_FIELDS = {
     "stopping",
     "entries",
     "state_digest",
+}
+_SERIES_V2_FIELDS = _SERIES_FIELDS | {
+    "generalization_digest",
+    "generalization_case_count",
+    "generalization_max_provider_calls",
+    "initial_policy_snapshot_digest",
+    "generalization_state",
 }
 _ENTRY_FIELDS = {
     "index",
@@ -109,6 +129,40 @@ _SCORE_FIELDS = {
     "ablation_gain",
 }
 _SERIES_DECIMAL_QUANTUM = Decimal("0.000000000001")
+_CONSUMPTION_FIELDS = {
+    "protocol",
+    "series_id",
+    "series_contract_digest",
+    "generalization_digest",
+    "state",
+    "artifact_path",
+    "artifact_digest",
+    "artifact_record_digest",
+    "record_digest",
+}
+_GENERALIZATION_ARTIFACT_FIELDS = {
+    "protocol",
+    "series_id",
+    "profile_id",
+    "series_contract_digest",
+    "initial_policy_digest",
+    "final_policy_digest",
+    "generalization_digest",
+    "case_count",
+    "matched_case_count",
+    "unavailable_case_count",
+    "provider_call_count",
+    "max_provider_calls",
+    "state",
+    "dimensions",
+    "failure_kind",
+    "record_digest",
+}
+_GENERALIZATION_TERMINAL_STATES = {"measured", "partial", "failed"}
+
+
+class GeneralizationInterrupted(RuntimeError):
+    """Raised by fault injection after irreversible consumption."""
 
 
 def _json_value(value: Any) -> Any:
@@ -287,6 +341,22 @@ def build_series_contract(profile: CampaignProfile) -> SeriesContract:
         "evaluator_audit_digest": audit_contract,
         "series_config_digest": canonical_digest(profile.series),
     }
+    if profile.generalization is not None:
+        manifest_relative = profile.generalization.manifest.path.relative_to(
+            profile.base.path.parent
+        ).as_posix()
+        components["generalization"] = {
+            "digest": profile.generalization.manifest.digest,
+            "case_count": len(profile.generalization.manifest.entries),
+            "max_provider_calls": profile.generalization.max_provider_calls,
+            "manifest_coordinate_digest": canonical_digest(manifest_relative),
+        }
+        components["series_config_digest"] = canonical_digest(
+            {
+                "series": profile.series,
+                "generalization": components["generalization"],
+            }
+        )
     return SeriesContract(
         components=components,
         digest=canonical_digest(components),
@@ -294,14 +364,21 @@ def build_series_contract(profile: CampaignProfile) -> SeriesContract:
 
 
 def build_initial_series_state(
-    profile: CampaignProfile, series_id: str
+    profile: CampaignProfile,
+    series_id: str,
+    *,
+    initial_policy_snapshot_digest: str | None = None,
 ) -> dict[str, Any]:
     validate_campaign_id(series_id)
     if profile.series is None:
         raise ValueError("campaign profile has no series configuration")
     contract = build_series_contract(profile)
     fields = {
-        "protocol": "kpo.campaign-series/v1",
+        "protocol": (
+            "kpo.campaign-series/v1"
+            if profile.generalization is None
+            else "kpo.campaign-series/v2"
+        ),
         "series_id": series_id,
         "profile_id": profile.base.profile_id,
         "state": "active",
@@ -317,7 +394,112 @@ def build_initial_series_state(
         },
         "entries": [],
     }
+    if profile.generalization is not None:
+        if not _valid_digest(initial_policy_snapshot_digest):
+            raise ValueError("invalid initial policy snapshot digest")
+        fields.update(
+            generalization_digest=profile.generalization.manifest.digest,
+            generalization_case_count=len(
+                profile.generalization.manifest.entries
+            ),
+            generalization_max_provider_calls=(
+                profile.generalization.max_provider_calls
+            ),
+            initial_policy_snapshot_digest=initial_policy_snapshot_digest,
+            generalization_state="available",
+        )
     return _with_state_digest(fields)
+
+
+def _initial_policy_snapshot_path(
+    profile: CampaignProfile, series_id: str
+) -> Path:
+    validate_campaign_id(series_id)
+    return (
+        profile.base.data_home
+        / "series"
+        / series_id
+        / "initial-policy.json"
+    )
+
+
+def _initial_policy_snapshot_record(policy: PolicySnapshot) -> dict[str, Any]:
+    fields = {
+        "protocol": "kpo.initial-policy-snapshot/v1",
+        "policy_digest": policy.digest,
+        "artifacts": [
+            {
+                "artifact_id": artifact.artifact_id,
+                "content": artifact.content,
+                "version": artifact.version,
+            }
+            for artifact in policy.artifacts
+        ],
+    }
+    return fields | {"record_digest": canonical_digest(fields)}
+
+
+def _persist_initial_policy_snapshot(
+    profile: CampaignProfile, series_id: str
+) -> str:
+    path = _initial_policy_snapshot_path(profile, series_id)
+    _atomic_new_json(path, _initial_policy_snapshot_record(profile.base.policy))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def load_initial_policy_snapshot(
+    profile: CampaignProfile,
+    series_id: str,
+    state: Mapping[str, Any],
+) -> PolicySnapshot:
+    path = _initial_policy_snapshot_path(profile, series_id)
+    if not path.is_file():
+        raise ValueError("initial policy snapshot is missing")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != state.get(
+        "initial_policy_snapshot_digest"
+    ):
+        raise ValueError("initial policy snapshot digest mismatch")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid initial policy snapshot") from error
+    snapshot = _strict(
+        raw,
+        {"protocol", "policy_digest", "artifacts", "record_digest"},
+        "initial policy snapshot",
+    )
+    fields = {
+        key: value for key, value in snapshot.items() if key != "record_digest"
+    }
+    if (
+        snapshot["protocol"] != "kpo.initial-policy-snapshot/v1"
+        or not _valid_digest(snapshot["record_digest"])
+        or snapshot["record_digest"] != canonical_digest(fields)
+        or not isinstance(snapshot["artifacts"], list)
+    ):
+        raise ValueError("invalid initial policy snapshot")
+    try:
+        artifacts = tuple(
+            PolicyArtifact(
+                artifact_id=item["artifact_id"],
+                content=item["content"],
+                version=item["version"],
+            )
+            for item in snapshot["artifacts"]
+            if isinstance(item, dict)
+            and set(item) == {"artifact_id", "content", "version"}
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid initial policy snapshot") from error
+    if len(artifacts) != len(snapshot["artifacts"]):
+        raise ValueError("invalid initial policy snapshot")
+    policy = PolicySnapshot.from_artifacts(artifacts)
+    if (
+        policy.digest != snapshot["policy_digest"]
+        or policy.digest != state.get("initial_policy_digest")
+    ):
+        raise ValueError("initial policy snapshot policy mismatch")
+    return policy
 
 
 def initialize_series(
@@ -326,12 +508,19 @@ def initialize_series(
     if not _locked:
         with series_mutation(profile, series_id, operation="initialize"):
             return initialize_series(profile, series_id, _locked=True)
-    state = build_initial_series_state(profile, series_id)
     path = _series_path(profile, series_id)
     try:
         path.parent.mkdir(parents=True)
     except FileExistsError as error:
         raise FileExistsError(f"campaign series already exists: {series_id}") from error
+    snapshot_digest = None
+    if profile.generalization is not None:
+        snapshot_digest = _persist_initial_policy_snapshot(profile, series_id)
+    state = build_initial_series_state(
+        profile,
+        series_id,
+        initial_policy_snapshot_digest=snapshot_digest,
+    )
     _atomic_json(path, state)
     return load_series_state(profile, series_id)
 
@@ -385,13 +574,22 @@ def _entry_dict(entry: SeriesEntry) -> dict[str, Any]:
 def _validate_series_state(
     profile: CampaignProfile, series_id: str, raw: Any
 ) -> dict[str, Any]:
-    state = _strict(raw, _SERIES_FIELDS, "campaign series")
+    if not isinstance(raw, dict):
+        raise ValueError("campaign series must be an object")
+    protocol = raw.get("protocol")
+    expected_fields = (
+        _SERIES_V2_FIELDS
+        if protocol == "kpo.campaign-series/v2"
+        else _SERIES_FIELDS
+    )
+    state = _strict(raw, expected_fields, "campaign series")
     digest = state["state_digest"]
     fields = {key: value for key, value in state.items() if key != "state_digest"}
     if not _valid_digest(digest) or digest != canonical_digest(fields):
         raise ValueError("campaign series state digest mismatch")
     if (
-        state["protocol"] != "kpo.campaign-series/v1"
+        state["protocol"]
+        not in {"kpo.campaign-series/v1", "kpo.campaign-series/v2"}
         or state["series_id"] != series_id
         or state["profile_id"] != profile.base.profile_id
         or state["state"] not in {"active", "stopped_by_owner"}
@@ -399,6 +597,13 @@ def _validate_series_state(
         raise ValueError("campaign series identity or state mismatch")
     if profile.series is None:
         raise ValueError("campaign profile has no series configuration")
+    expected_protocol = (
+        "kpo.campaign-series/v1"
+        if profile.generalization is None
+        else "kpo.campaign-series/v2"
+    )
+    if state["protocol"] != expected_protocol:
+        raise ValueError("campaign series contract mismatch")
     contract = build_series_contract(profile)
     if (
         state["contract"] != _json_value(contract.components)
@@ -415,6 +620,31 @@ def _validate_series_state(
         raise ValueError("campaign series contract mismatch")
     if not _valid_digest(state["initial_policy_digest"]):
         raise ValueError("invalid initial policy digest")
+    if profile.generalization is not None:
+        if (
+            state["generalization_digest"]
+            != profile.generalization.manifest.digest
+            or state["generalization_case_count"]
+            != len(profile.generalization.manifest.entries)
+            or state["generalization_max_provider_calls"]
+            != profile.generalization.max_provider_calls
+            or state["generalization_state"]
+            not in {
+                "available",
+                "measuring",
+                "measuring_interrupted",
+                "measured",
+                "partial",
+                "failed",
+            }
+            or not _valid_digest(state["initial_policy_snapshot_digest"])
+        ):
+            raise ValueError("campaign series generalization contract mismatch")
+        snapshot_path = _initial_policy_snapshot_path(profile, series_id)
+        if not snapshot_path.is_file() or hashlib.sha256(
+            snapshot_path.read_bytes()
+        ).hexdigest() != state["initial_policy_snapshot_digest"]:
+            raise ValueError("initial policy snapshot digest mismatch")
     if not isinstance(state["entries"], list):
         raise ValueError("campaign series entries must be an array")
     seen_campaigns: set[str] = set()
@@ -662,7 +892,7 @@ def _recover_stale_series_lock(
         expected_series_parent(profile, state)
         lock_path.unlink()
         return
-    if operation in {"initialize", "reconcile", "stop"}:
+    if operation in {"initialize", "reconcile", "stop", "generalize"}:
         state = load_series_state(profile, series_id)
         _require_no_applying_promotion(profile, state)
         lock_path.unlink()
@@ -1330,6 +1560,480 @@ def _calibration_trend_item(
     }
 
 
+def _consumption_path(profile: CampaignProfile, series_id: str) -> Path:
+    validate_campaign_id(series_id)
+    return (
+        profile.base.data_home
+        / "series"
+        / series_id
+        / "generalization-consumption.json"
+    )
+
+
+def _generalization_artifact_path(
+    profile: CampaignProfile, series_id: str
+) -> Path:
+    validate_campaign_id(series_id)
+    return (
+        profile.base.data_home / "series" / series_id / "generalization.json"
+    )
+
+
+def _generalization_ledger_path(
+    profile: CampaignProfile, series_id: str
+) -> Path:
+    validate_campaign_id(series_id)
+    return (
+        profile.base.data_home
+        / "series"
+        / series_id
+        / "generalization-calls.json"
+    )
+
+
+def _record_digest(fields: Mapping[str, Any]) -> dict[str, Any]:
+    value = dict(fields)
+    return value | {"record_digest": canonical_digest(value)}
+
+
+def _initial_consumption(
+    profile: CampaignProfile, series_id: str, state: Mapping[str, Any]
+) -> dict[str, Any]:
+    return _record_digest(
+        {
+            "protocol": "kpo.generalization-consumption/v1",
+            "series_id": series_id,
+            "series_contract_digest": state["series_contract_digest"],
+            "generalization_digest": state["generalization_digest"],
+            "state": "measuring",
+            "artifact_path": None,
+            "artifact_digest": None,
+            "artifact_record_digest": None,
+        }
+    )
+
+
+def _load_consumption(
+    profile: CampaignProfile, series_id: str
+) -> dict[str, Any]:
+    path = _consumption_path(profile, series_id)
+    if not path.is_file():
+        raise KeyError("generalization consumption record is missing")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid generalization consumption record") from error
+    record = _strict(raw, _CONSUMPTION_FIELDS, "generalization consumption")
+    fields = {
+        key: value for key, value in record.items() if key != "record_digest"
+    }
+    if (
+        record["protocol"] != "kpo.generalization-consumption/v1"
+        or record["series_id"] != series_id
+        or not _valid_digest(record["record_digest"])
+        or record["record_digest"] != canonical_digest(fields)
+        or record["state"] not in {"measuring", *_GENERALIZATION_TERMINAL_STATES}
+    ):
+        raise ValueError("invalid generalization consumption record")
+    return record
+
+
+def _set_generalization_state(
+    profile: CampaignProfile,
+    series_id: str,
+    state: Mapping[str, Any],
+    value: str,
+) -> dict[str, Any]:
+    fields = {key: item for key, item in state.items() if key != "state_digest"}
+    fields["generalization_state"] = value
+    updated = _with_state_digest(fields)
+    _atomic_json(_series_path(profile, series_id), updated)
+    return load_series_state(profile, series_id)
+
+
+class _GeneralizationExecutor:
+    def __init__(
+        self,
+        profile: CampaignProfile,
+        series_id: str,
+        budget: int,
+        *,
+        monitor: IntegrityMonitor,
+        invoker: Callable[[Any, str, dict[str, Any]], dict[str, Any]] = _invoke,
+    ) -> None:
+        self.profile = profile
+        self.series_id = series_id
+        self.budget = budget
+        self.invoker = invoker
+        self.monitor = monitor
+        self.calls: list[dict[str, Any]] = []
+
+    @property
+    def call_count(self) -> int:
+        return len(self.calls)
+
+    def _persist(self) -> None:
+        fields = {
+            "protocol": "kpo.generalization-call-ledger/v1",
+            "series_id": self.series_id,
+            "max_provider_calls": self.budget,
+            "calls": self.calls,
+        }
+        _atomic_json(
+            _generalization_ledger_path(self.profile, self.series_id),
+            _record_digest(fields),
+        )
+
+    def invoke(
+        self,
+        config: Any,
+        role: str,
+        request: dict[str, Any],
+        *,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        del context
+        if self.call_count >= self.budget:
+            raise ValueError("generalization provider budget exhausted")
+        call = {
+            "index": self.call_count,
+            "role": role,
+            "request_digest": canonical_digest(request),
+            "response_digest": None,
+            "state": "started",
+        }
+        self.calls.append(call)
+        self._persist()
+        try:
+            response = self.invoker(config, role, request)
+        except BaseException:
+            call["state"] = "failed"
+            self._persist()
+            self.monitor.verify()
+            raise
+        self.monitor.verify()
+        call["response_digest"] = canonical_digest(response)
+        call["state"] = "succeeded"
+        self._persist()
+        return response
+
+
+def _validate_generalization_preflight(
+    profile: CampaignProfile, series_id: str, state: Mapping[str, Any]
+) -> tuple[PolicySnapshot, str, dict[str, float]]:
+    if profile.generalization is None or state["protocol"] != "kpo.campaign-series/v2":
+        raise ValueError("generalization_not_configured")
+    if _consumption_path(profile, series_id).exists():
+        raise ValueError("generalization_consumed")
+    if state["state"] != "stopped_by_owner":
+        raise ValueError("series_not_stopped")
+    required_calls = 4 * len(profile.generalization.manifest.entries)
+    if profile.generalization.max_provider_calls < required_calls:
+        raise ValueError("generalization_budget_insufficient")
+    expected_final = expected_series_parent(profile, state)
+    bound = {
+        (entry["campaign_id"], entry["revision"])
+        for entry in state["entries"]
+    }
+    campaigns_root = profile.base.data_home / "campaigns"
+    for path in sorted(campaigns_root.glob("*/campaign.json")):
+        try:
+            campaign = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("series_reconcile_required") from error
+        if campaign.get("series_id") != series_id:
+            continue
+        coordinate = (
+            campaign.get("campaign_id"),
+            campaign.get("series_evidence_revision"),
+        )
+        if (
+            campaign.get("state") not in _TERMINAL_CAMPAIGN_STATES
+            or coordinate not in bound
+        ):
+            raise ValueError("series_reconcile_required")
+        if campaign.get("promotion_state") in {"previewed", "applying"}:
+            raise ValueError("series_promotion_not_final")
+    if profile.base.policy.digest != expected_final:
+        raise ValueError("series_lineage_mismatch")
+    initial = load_initial_policy_snapshot(profile, series_id, state)
+    report = series_evidence_report(profile, series_id)
+    holdout = report["cumulative_applied_holdout_gain"]
+    return initial, expected_final, {
+        name: float(holdout[name]) for name in profile.base.rubric.dimension_names
+    }
+
+
+def _weighted_score(
+    values: list[tuple[float, float]],
+) -> float:
+    numerator = sum(
+        Decimal(str(score)) * Decimal(str(weight))
+        for score, weight in values
+    )
+    denominator = sum(Decimal(str(weight)) for _, weight in values)
+    return float((numerator / denominator).quantize(_SERIES_DECIMAL_QUANTUM))
+
+
+def _load_generalization_artifact(
+    profile: CampaignProfile,
+    series_id: str,
+    consumption: Mapping[str, Any],
+) -> dict[str, Any]:
+    path = _generalization_artifact_path(profile, series_id)
+    expected_relative = f"series/{series_id}/generalization.json"
+    if consumption.get("artifact_path") != expected_relative or not path.is_file():
+        raise ValueError("generalization artifact binding mismatch")
+    payload = path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != consumption.get("artifact_digest"):
+        raise ValueError("generalization artifact binding mismatch")
+    try:
+        raw = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("invalid generalization artifact") from error
+    artifact = _strict(
+        raw, _GENERALIZATION_ARTIFACT_FIELDS, "generalization artifact"
+    )
+    fields = {
+        key: value for key, value in artifact.items() if key != "record_digest"
+    }
+    if (
+        artifact["protocol"] != "kpo.series-generalization/v1"
+        or artifact["series_id"] != series_id
+        or artifact["profile_id"] != profile.base.profile_id
+        or artifact["state"] not in _GENERALIZATION_TERMINAL_STATES
+        or artifact["record_digest"] != canonical_digest(fields)
+        or artifact["record_digest"]
+        != consumption.get("artifact_record_digest")
+    ):
+        raise ValueError("invalid generalization artifact")
+    return artifact
+
+
+def _generalization_measurement_summary(
+    profile: CampaignProfile,
+    series_id: str,
+    state: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if profile.generalization is None:
+        return None
+    path = _consumption_path(profile, series_id)
+    if not path.exists():
+        return None
+    consumption = _load_consumption(profile, series_id)
+    if consumption["state"] == "measuring":
+        return None
+    artifact = _load_generalization_artifact(profile, series_id, consumption)
+    if state["generalization_state"] != artifact["state"]:
+        raise ValueError("generalization state binding mismatch")
+    return {
+        "state": artifact["state"],
+        "case_count": artifact["case_count"],
+        "matched_case_count": artifact["matched_case_count"],
+        "unavailable_case_count": artifact["unavailable_case_count"],
+        "provider_call_count": artifact["provider_call_count"],
+        "dimensions": artifact["dimensions"],
+        "failure_kind": artifact["failure_kind"],
+        "record_digest": artifact["record_digest"],
+    }
+
+
+def generalize_series(
+    profile: CampaignProfile,
+    series_id: str,
+    *,
+    fault_after_consumption: bool = False,
+    invoker: Callable[[Any, str, dict[str, Any]], dict[str, Any]] = _invoke,
+) -> dict[str, Any]:
+    validate_campaign_id(series_id)
+    monitor = campaign_integrity_monitor(profile)
+    monitor.verify()
+    _recover_stale_series_lock(profile, series_id)
+    with series_mutation(profile, series_id, operation="generalize"):
+        state = load_series_state(profile, series_id)
+        initial_policy, final_policy_digest, holdout = (
+            _validate_generalization_preflight(profile, series_id, state)
+        )
+        consumption = _initial_consumption(profile, series_id, state)
+        try:
+            _atomic_new_json(_consumption_path(profile, series_id), consumption)
+        except FileExistsError as error:
+            raise ValueError("generalization_consumed") from error
+        state = _set_generalization_state(
+            profile, series_id, state, "measuring"
+        )
+    if fault_after_consumption:
+        raise GeneralizationInterrupted(series_id)
+
+    assert profile.generalization is not None
+    executor = _GeneralizationExecutor(
+        profile,
+        series_id,
+        profile.generalization.max_provider_calls,
+        monitor=monitor,
+        invoker=invoker,
+    )
+    names = tuple(profile.base.rubric.dimension_names)
+    initial_values: dict[str, list[tuple[float, float]]] = {
+        name: [] for name in names
+    }
+    final_values: dict[str, list[tuple[float, float]]] = {
+        name: [] for name in names
+    }
+    matched = 0
+    failure_kind: str | None = None
+    try:
+        for entry in profile.generalization.manifest.entries:
+            case = profile.base.cases[entry.case_id]
+            references = tuple(
+                profile.base.references[item]
+                for item in case.hidden_reference_ids
+            )
+            initial_rollout = run_actor(
+                case,
+                initial_policy,
+                CommandActorProvider(profile.base.actor, executor=executor),
+                model_id=profile.base.actor.identity,
+            )
+            initial_evaluation = evaluate_rollout(
+                case,
+                initial_rollout,
+                references,
+                CommandEvaluatorProvider(
+                    profile.base.evaluator,
+                    profile.base.rubric,
+                    executor=executor,
+                ),
+                evaluator_id=profile.base.evaluator.identity,
+                rubric_version=profile.base.rubric.rubric_version,
+            )
+            final_rollout = run_actor(
+                case,
+                profile.base.policy,
+                CommandActorProvider(profile.base.actor, executor=executor),
+                model_id=profile.base.actor.identity,
+            )
+            final_evaluation = evaluate_rollout(
+                case,
+                final_rollout,
+                references,
+                CommandEvaluatorProvider(
+                    profile.base.evaluator,
+                    profile.base.rubric,
+                    executor=executor,
+                ),
+                evaluator_id=profile.base.evaluator.identity,
+                rubric_version=profile.base.rubric.rubric_version,
+            )
+            initial_scores = {
+                item.name: item.score for item in initial_evaluation.dimensions
+            }
+            final_scores = {
+                item.name: item.score for item in final_evaluation.dimensions
+            }
+            for name in names:
+                initial_values[name].append((initial_scores[name], entry.weight))
+                final_values[name].append((final_scores[name], entry.weight))
+            matched += 1
+    except IntegrityViolation:
+        failure_kind = "generalization_source_integrity"
+    except ProviderFailure as error:
+        failure_kind = (
+            "generalization_protocol_failure"
+            if error.kind
+            in {ProviderFailureKind.INVALID_ENCODING, ProviderFailureKind.INVALID_RESPONSE}
+            else "generalization_provider_failure"
+        )
+    except (KeyError, TypeError, ValueError):
+        failure_kind = "generalization_protocol_failure"
+
+    case_count = len(profile.generalization.manifest.entries)
+    terminal = (
+        "measured"
+        if matched == case_count
+        else "partial" if matched else "failed"
+    )
+    dimensions: dict[str, dict[str, float | None]] = {}
+    for name in names:
+        if not matched:
+            dimensions[name] = {
+                "initial_score": None,
+                "final_score": None,
+                "generalization_gain": None,
+                "holdout_gain": holdout[name],
+                "divergence": None,
+            }
+            continue
+        initial_score = _weighted_score(initial_values[name])
+        final_score = _weighted_score(final_values[name])
+        gain = float(
+            (Decimal(str(final_score)) - Decimal(str(initial_score))).quantize(
+                _SERIES_DECIMAL_QUANTUM
+            )
+        )
+        divergence = float(
+            (Decimal(str(gain)) - Decimal(str(holdout[name]))).quantize(
+                _SERIES_DECIMAL_QUANTUM
+            )
+        )
+        dimensions[name] = {
+            "initial_score": initial_score,
+            "final_score": final_score,
+            "generalization_gain": gain,
+            "holdout_gain": holdout[name],
+            "divergence": divergence,
+        }
+    artifact = _record_digest(
+        {
+            "protocol": "kpo.series-generalization/v1",
+            "series_id": series_id,
+            "profile_id": profile.base.profile_id,
+            "series_contract_digest": state["series_contract_digest"],
+            "initial_policy_digest": initial_policy.digest,
+            "final_policy_digest": final_policy_digest,
+            "generalization_digest": profile.generalization.manifest.digest,
+            "case_count": case_count,
+            "matched_case_count": matched,
+            "unavailable_case_count": case_count - matched,
+            "provider_call_count": executor.call_count,
+            "max_provider_calls": profile.generalization.max_provider_calls,
+            "state": terminal,
+            "dimensions": dimensions,
+            "failure_kind": failure_kind,
+        }
+    )
+    artifact_path = _generalization_artifact_path(profile, series_id)
+    _atomic_new_json(artifact_path, artifact)
+    artifact_digest = hashlib.sha256(artifact_path.read_bytes()).hexdigest()
+    relative_path = f"series/{series_id}/generalization.json"
+    with series_mutation(profile, series_id, operation="generalize"):
+        current = load_series_state(profile, series_id)
+        existing = _load_consumption(profile, series_id)
+        if existing["state"] != "measuring":
+            raise ValueError("generalization_consumed")
+        terminal_consumption = _record_digest(
+            {
+                "protocol": existing["protocol"],
+                "series_id": existing["series_id"],
+                "series_contract_digest": existing["series_contract_digest"],
+                "generalization_digest": existing["generalization_digest"],
+                "state": terminal,
+                "artifact_path": relative_path,
+                "artifact_digest": artifact_digest,
+                "artifact_record_digest": artifact["record_digest"],
+            }
+        )
+        _atomic_json(_consumption_path(profile, series_id), terminal_consumption)
+        _set_generalization_state(
+            profile, series_id, current, terminal
+        )
+    return _load_generalization_artifact(
+        profile,
+        series_id,
+        _load_consumption(profile, series_id),
+    )
+
+
 def series_evidence_report(
     profile: CampaignProfile, series_id: str, *, full: bool = False
 ) -> dict[str, Any]:
@@ -1467,13 +2171,19 @@ def series_evidence_report(
             }
             for record in all_evidence
         ]
+    if profile.generalization is not None:
+        result["generalization_measurement"] = (
+            _generalization_measurement_summary(
+                profile, series_id, state
+            )
+        )
     return result
 
 
 def series_status(profile: CampaignProfile, series_id: str) -> dict[str, Any]:
     report = series_evidence_report(profile, series_id)
     state = load_series_state(profile, series_id)
-    return {
+    result = {
         "series_id": series_id,
         "state": report["state"],
         "campaign_count": report["campaign_count"],
@@ -1485,3 +2195,14 @@ def series_status(profile: CampaignProfile, series_id: str) -> dict[str, Any]:
         "indicators": report["indicators"],
         "series_contract_digest": report["series_contract_digest"],
     }
+    if profile.generalization is not None:
+        consumed = _consumption_path(profile, series_id).exists()
+        generalization_state = state["generalization_state"]
+        if consumed and generalization_state == "measuring":
+            generalization_state = "measuring_interrupted"
+        result.update(
+            generalization_state=generalization_state,
+            generalization_case_count=state["generalization_case_count"],
+            generalization_consumed=consumed,
+        )
+    return result

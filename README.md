@@ -1,9 +1,8 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.8 development milestone. KPO can organize immutable Campaign
-> series, preserve failed/resumed revision history, and report privacy-safe
-> aggregate learning curves while keeping runtime evidence outside the
-> repository.
+> Status: v0.9 development milestone. KPO can reserve untouched
+> generalization cases and measure, exactly once, whether an apparently
+> improving Campaign series transfers beyond its repeatedly used holdout.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -122,6 +121,10 @@ operation with an allowlist, diff, snapshot, and journal.
   evidence append, owner stop, and interrupted-allocation recovery;
 - privacy-reviewed agreement and calibration trends that never expose per-case
   or per-anchor observations;
+- optional generalization manifests that remain structurally separate from all
+  Campaign partitions, diagnosis, Proposer feedback, gates, and promotion;
+- end-of-series matched initial/final policy measurement under a separate
+  finite budget, with one-way consumption and aggregate holdout divergence;
 - byte-exact source and target integrity checks that avoid hashing the same
   physical file twice within one verification pass.
 
@@ -310,6 +313,38 @@ history. `series reconcile` repairs a verified terminal-state/append crash gap
 without Provider calls. Quality indicators are advisory; `max_campaigns` and
 an explicit owner stop are enforced before new Provider work.
 
+### Measure untouched generalization once
+
+An optional generalization manifest is frozen with the series but never used
+during Campaign optimization:
+
+```toml
+[series.generalization]
+manifest = "./generalization.jsonl"
+max_provider_calls = 80
+```
+
+After all selected promotions are applied, stop the series and explicitly open
+the one-way measurement gate:
+
+```bash
+uv run kpo series stop \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID
+
+uv run kpo series generalize \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID
+```
+
+KPO evaluates the immutable initial policy and verified final policy on the
+untouched cases, then reports only per-dimension aggregate initial/final scores,
+generalization gain, cumulative applied holdout gain, and their signed
+divergence. The partition is consumed before the first Provider call and can
+never be measured again, including after interruption or failure. The result
+is evidence for operator judgment; it never triggers an automatic rollback or
+promotion decision.
+
 Dataset expansion follows the same preview/approval rule:
 
 ```bash
@@ -383,3 +418,4 @@ Approved specifications:
 - [v0.6 Evaluator agreement audit](docs/specs/0006-evaluator-agreement-audit.md)
 - [v0.7 Evaluator calibration and drift](docs/specs/0007-evaluator-calibration-and-drift.md)
 - [v0.8 Campaign series orchestration](docs/specs/0008-campaign-series-orchestration.md)
+- [v0.9 untouched generalization measurement](docs/specs/0009-untouched-generalization-measurement.md)

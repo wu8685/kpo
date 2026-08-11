@@ -1,7 +1,8 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.2 development milestone. The verified optimization core now runs
-> external profiles through isolated command-based Actor and Evaluator adapters.
+> Status: v0.3 development milestone. KPO can now run finite, budgeted
+> optimization campaigns over external datasets and produce reviewable policy
+> promotion previews.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -64,7 +65,7 @@ artifacts live in a user-controlled data directory outside the checkout.
 Writing back to a knowledge store is a separate, explicitly approved promotion
 operation with an allowlist, diff, snapshot, and journal.
 
-## MVP capabilities
+## Current capabilities
 
 - immutable case, policy, rollout, evaluation, diagnosis, and candidate schemas;
 - provider-neutral Actor and Evaluator protocols with hidden-reference
@@ -75,15 +76,30 @@ operation with an allowlist, diff, snapshot, and journal.
 - preview-first promotion with allowlists, digest-bound approval, snapshots,
   journals, and interruption recovery;
 - repository and privacy hygiene checks;
-- a deterministic, network-free end-to-end demonstration.
+- a deterministic, network-free end-to-end demonstration;
 - strict external TOML profiles with JSON/JSONL manifests;
 - real subprocess provider execution through a versioned JSON protocol;
 - cross-process `run`, `evaluate`, and `status` persistence;
-- source-drift detection, opt-in provider environments, and stderr redaction.
+- source-drift detection, opt-in provider environments, and stderr redaction;
+- strict four-part datasets with provenance, deduplication, contamination checks,
+  and an immutable holdout lock;
+- finite campaigns with explicit iteration and provider-call budgets;
+- train-only diagnosis and Proposer feedback that withholds holdout details;
+- matched per-dimension validation, holdout, regression, and ablation gates;
+- persistent provider-call caching, failure records, and resumable failed runs;
+- preview-approved dataset growth with snapshots, journals, and recovery;
+- preview-only campaign promotion with deterministic destination mapping.
 
 Provider-specific SDK wrappers remain external. A wrapper can connect the
 command protocol to a local model, remote API, Gateway, or existing Agent
 runtime without placing real policy or domain data in this repository.
+
+Command adapters are trusted plugins. KPO reduces accidental access with an
+external working directory, a minimal environment, and path-free requests, and
+it detects source or promotion-target drift after every provider call. It does
+not claim to stop a malicious process that already has the operating system
+user's file permissions. Hard write prevention requires an operator-managed
+container or read-only mount and is not provided by v0.3.
 
 ## Run the synthetic demonstration
 
@@ -137,6 +153,42 @@ uv run kpo status --profile /path/outside/kpo/profile.toml --run RUN_ID
 hidden references, and rejects the operation if any recorded source changed
 after the rollout.
 
+## Run an optimization campaign
+
+A campaign profile extends the external profile with a dataset manifest,
+Proposer adapter, per-dimension gates, budgets, and promotion destinations. The
+[v0.3 specification](docs/specs/0003-optimization-campaign.md) defines the full
+contract.
+
+```bash
+# Validate all profile, dataset, gate, path, and adapter contracts.
+uv run kpo validate-profile --profile /path/outside/kpo/profile.toml
+
+# Freeze the initial holdout set through preview-bound approval.
+uv run kpo dataset init --profile /path/outside/kpo/profile.toml
+uv run kpo dataset init \
+  --profile /path/outside/kpo/profile.toml \
+  --approve APPROVAL_DIGEST
+
+# Run until a promotion preview, a finite budget, or another terminal condition.
+uv run kpo campaign --profile /path/outside/kpo/profile.toml
+uv run kpo campaign-status \
+  --profile /path/outside/kpo/profile.toml \
+  --campaign CAMPAIGN_ID
+```
+
+Dataset expansion follows the same preview/approval rule:
+
+```bash
+uv run kpo dataset grow \
+  --profile /path/outside/kpo/profile.toml \
+  --inbox /path/outside/kpo/candidate-dataset.jsonl
+```
+
+The holdout partition cannot be added to, removed from, edited, reweighted, or
+repartitioned after initialization. A passing campaign stops at a promotion
+preview; applying that change remains a separate consequential decision.
+
 ## Verify the repository
 
 ```bash
@@ -164,3 +216,4 @@ Approved specifications:
 
 - [v0.1 optimization core](docs/specs/0001-kpo-v0.1.md)
 - [v0.2 external profile execution](docs/specs/0002-external-profile-execution.md)
+- [v0.3 optimization campaign](docs/specs/0003-optimization-campaign.md)

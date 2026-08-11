@@ -7,6 +7,7 @@ from typing import Any
 
 from kpo.digest import canonical_digest, canonical_json
 from kpo.models import Rollout
+from kpo.integrity import IntegrityMonitor, IntegrityViolation
 from kpo.pipeline import evaluate_rollout, run_actor
 from kpo.profile import ExternalProfile, load_profile
 from kpo.provider import CommandActorProvider, CommandEvaluatorProvider, ProviderFailure
@@ -38,6 +39,14 @@ def run_profile(profile_path: Path, case_id: str, *, checkout: Path) -> dict[str
     if case_id not in profile.cases:
         raise KeyError(f"unknown case: {case_id}")
     profile.data_home.mkdir(parents=True, exist_ok=True)
+    monitor = IntegrityMonitor.from_relative_digests(
+        profile.path.parent,
+        profile.source_digests,
+        extra_files=(
+            Path(profile.actor.command[0]),
+            Path(profile.evaluator.command[0]),
+        ),
+    )
     store = RuntimeStore(profile.data_home)
     run_id = uuid.uuid4().hex
     record = store.create_run(
@@ -56,7 +65,8 @@ def run_profile(profile_path: Path, case_id: str, *, checkout: Path) -> dict[str
             CommandActorProvider(profile.actor),
             model_id=profile.actor.identity,
         )
-    except ProviderFailure:
+        monitor.verify()
+    except (ProviderFailure, IntegrityViolation):
         store.transition_run(run_id, RunState.FAILED)
         raise
     artifact = store.put_artifact("rollout", canonical_json(rollout))
@@ -89,6 +99,14 @@ def evaluate_profile_run(
     profile_path: Path, run_id: str, *, checkout: Path
 ) -> dict[str, Any]:
     profile = load_profile(profile_path, checkout=checkout)
+    monitor = IntegrityMonitor.from_relative_digests(
+        profile.path.parent,
+        profile.source_digests,
+        extra_files=(
+            Path(profile.actor.command[0]),
+            Path(profile.evaluator.command[0]),
+        ),
+    )
     store = RuntimeStore(profile.data_home)
     record = store.get_run(run_id)
     if record.state is not RunState.COMPLETED:
@@ -111,7 +129,8 @@ def evaluate_profile_run(
             evaluator_id=profile.evaluator.identity,
             rubric_version=profile.rubric.rubric_version,
         )
-    except ProviderFailure:
+        monitor.verify()
+    except (ProviderFailure, IntegrityViolation):
         store.transition_run(run_id, RunState.FAILED)
         raise
     artifact = store.put_artifact("evaluation", canonical_json(evaluation))

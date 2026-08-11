@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import get_type_hints
 
 import pytest
 
@@ -10,8 +11,12 @@ from kpo.models import (
     PolicySnapshot,
     RegressionCase,
 )
-from kpo.promotion import PromotionInterrupted, PromotionManager
+from kpo.promotion import PromotionInterrupted, PromotionManager, PromotionReport
 from kpo.regression import run_regression
+
+
+def test_preview_uses_the_minimal_promotion_report_protocol() -> None:
+    assert get_type_hints(PromotionManager.preview)["report"] is PromotionReport
 
 
 def approved_candidate() -> tuple[CandidatePatch, object]:

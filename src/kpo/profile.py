@@ -7,7 +7,7 @@ import os
 import re
 import shutil
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping
@@ -41,6 +41,7 @@ class CommandProviderConfig:
     identity: str
     timeout_seconds: float
     pass_env: tuple[str, ...]
+    working_directory: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +179,11 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
             "rubric",
             "actor",
             "evaluator",
+            "dataset",
+            "proposer",
+            "campaign",
+            "promotion",
+            "sandbox",
         },
         label="profile",
     )
@@ -334,6 +340,13 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
         for source in source_paths
     ):
         raise ValueError("data_home overlaps a source file")
+
+    actor = replace(
+        actor, working_directory=data_home / "provider-work" / "actor"
+    )
+    evaluator = replace(
+        evaluator, working_directory=data_home / "provider-work" / "evaluator"
+    )
 
     digests = MappingProxyType(
         {str(source.relative_to(root)): _digest_file(source) for source in source_paths}

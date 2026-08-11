@@ -6,15 +6,42 @@ import re
 import subprocess
 from enum import Enum
 from typing import Any
+from collections.abc import Mapping
+from typing import Protocol
 
 from kpo.models import (
     DiagnosisKind,
     EvaluatorResult,
     FailureSignal,
+    MutationKind,
+    ProposalDraft,
     ScoreDimension,
 )
-from kpo.pipeline import ActorRequest, EvaluatorRequest
+from kpo.pipeline import ActorRequest, EvaluatorRequest, ProposerRequest
 from kpo.profile import CommandProviderConfig, Rubric
+
+
+class InvocationExecutor(Protocol):
+    def invoke(
+        self,
+        config: CommandProviderConfig,
+        role: str,
+        request: dict[str, Any],
+        *,
+        context: Mapping[str, Any],
+    ) -> dict[str, Any]: ...
+
+
+def _dispatch(
+    config: CommandProviderConfig,
+    role: str,
+    request: dict[str, Any],
+    executor: InvocationExecutor | None,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    if executor is None:
+        return _invoke(config, role, request)
+    return executor.invoke(config, role, request, context=context)
 
 
 class ProviderFailureKind(str, Enum):
@@ -35,6 +62,7 @@ class ProviderFailure(RuntimeError):
         stderr_excerpt: str = "",
     ) -> None:
         self.kind = kind
+        self.detail = message
         self.stderr_excerpt = stderr_excerpt
         suffix = f": {stderr_excerpt}" if stderr_excerpt else ""
         super().__init__(f"provider failure ({kind.value}): {message}{suffix}")
@@ -89,6 +117,9 @@ def _invoke(config: CommandProviderConfig, role: str, request: dict[str, Any]) -
     ).encode("utf-8")
     environment, secret_values = _environment(config)
     try:
+        working_directory = config.working_directory
+        if working_directory is not None:
+            working_directory.mkdir(parents=True, exist_ok=True)
         completed = subprocess.run(
             config.command,
             input=payload,
@@ -97,6 +128,7 @@ def _invoke(config: CommandProviderConfig, role: str, request: dict[str, Any]) -
             env=environment,
             timeout=config.timeout_seconds,
             check=False,
+            cwd=working_directory,
         )
     except FileNotFoundError as error:
         raise ProviderFailure(
@@ -141,14 +173,19 @@ def _strict_response(value: dict[str, Any], allowed: set[str], label: str) -> No
 
 
 class CommandActorProvider:
-    def __init__(self, config: CommandProviderConfig) -> None:
+    def __init__(
+        self,
+        config: CommandProviderConfig,
+        *,
+        executor: InvocationExecutor | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
         self.config = config
+        self.executor = executor
+        self.context = context or {}
 
     def generate(self, request: ActorRequest) -> str:
-        value = _invoke(
-            self.config,
-            "actor",
-            {
+        request_value = {
                 "case": request.case_payload,
                 "policy_artifacts": [
                     {
@@ -159,7 +196,13 @@ class CommandActorProvider:
                     for artifact in request.policy_artifacts
                 ],
                 "model_id": self.config.identity,
-            },
+            }
+        value = _dispatch(
+            self.config,
+            "actor",
+            request_value,
+            self.executor,
+            self.context,
         )
         _strict_response(value, {"output"}, "actor")
         output = value["output"]
@@ -171,12 +214,21 @@ class CommandActorProvider:
 
 
 class CommandEvaluatorProvider:
-    def __init__(self, config: CommandProviderConfig, rubric: Rubric) -> None:
+    def __init__(
+        self,
+        config: CommandProviderConfig,
+        rubric: Rubric,
+        *,
+        executor: InvocationExecutor | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
         self.config = config
         self.rubric = rubric
+        self.executor = executor
+        self.context = context or {}
 
     def evaluate(self, request: EvaluatorRequest) -> EvaluatorResult:
-        value = _invoke(
+        value = _dispatch(
             self.config,
             "evaluator",
             {
@@ -211,6 +263,8 @@ class CommandEvaluatorProvider:
                 },
                 "evaluator_id": self.config.identity,
             },
+            self.executor,
+            self.context,
         )
         _strict_response(
             value, {"dimensions", "failure_signals", "aggregate_score"}, "evaluator"
@@ -258,4 +312,126 @@ class CommandEvaluatorProvider:
             raise ProviderFailure(
                 ProviderFailureKind.INVALID_RESPONSE,
                 "evaluator response violates the schema",
+            ) from error
+
+
+class CommandProposerProvider:
+    def __init__(
+        self,
+        config: CommandProviderConfig,
+        *,
+        executor: InvocationExecutor | None = None,
+        context: Mapping[str, Any] | None = None,
+    ) -> None:
+        self.config = config
+        self.proposer_id = config.identity
+        self.executor = executor
+        self.context = context or {}
+
+    def propose(self, request: ProposerRequest) -> ProposalDraft:
+        value = _dispatch(
+            self.config,
+            "proposer",
+            {
+                "parent_policy": {
+                    "digest": request.parent_policy.digest,
+                    "artifacts": [
+                        {
+                            "artifact_id": artifact.artifact_id,
+                            "version": artifact.version,
+                            "content": artifact.content,
+                        }
+                        for artifact in request.parent_policy.artifacts
+                    ],
+                },
+                "rollout": {
+                    "case_id": request.rollout.case_id,
+                    "output": request.rollout.output,
+                    "digest": request.rollout.digest,
+                },
+                "evaluation": {
+                    "digest": request.evaluation.digest,
+                    "dimensions": [
+                        {
+                            "name": item.name,
+                            "score": item.score,
+                            "explanation": item.explanation,
+                            "citations": item.citations,
+                        }
+                        for item in request.evaluation.dimensions
+                    ],
+                    "failure_signals": [
+                        {
+                            "kind": item.kind.value,
+                            "message": item.message,
+                            "citations": item.citations,
+                        }
+                        for item in request.evaluation.failure_signals
+                    ],
+                },
+                "diagnosis": {
+                    "digest": request.diagnosis.digest,
+                    "kind": request.diagnosis.kind.value,
+                    "message": request.diagnosis.message,
+                    "citations": request.diagnosis.citations,
+                },
+                "references": [
+                    {
+                        "artifact_id": item.artifact_id,
+                        "kind": item.kind,
+                        "content": item.content,
+                    }
+                    for item in request.references
+                ],
+                "allowed_mutations": request.allowed_mutations,
+                "rejected_candidates": [
+                    {
+                        "candidate_digest": item.candidate_digest,
+                        "mutation": item.mutation.value,
+                        "artifact_id": item.artifact_id,
+                        "validation_deltas": dict(item.validation_deltas),
+                        "regression_deltas": dict(item.regression_deltas),
+                        "failed_gates": item.failed_gates,
+                    }
+                    for item in request.rejected_candidates
+                ],
+                "model_id": self.config.identity,
+            },
+            self.executor,
+            self.context,
+        )
+        _strict_response(
+            value,
+            {
+                "mutation",
+                "artifact_id",
+                "content",
+                "expected_benefit",
+                "possible_regressions",
+            },
+            "proposer",
+        )
+        try:
+            mutation = MutationKind(value["mutation"])
+            if mutation not in {MutationKind.ADD, MutationKind.EDIT}:
+                raise ValueError(f"unsupported proposer mutation: {mutation.value}")
+            regressions = value["possible_regressions"]
+            if not isinstance(regressions, list) or any(
+                not isinstance(item, str) or not item.strip() for item in regressions
+            ):
+                raise ValueError("possible_regressions must be a string array")
+            for field in ("artifact_id", "content", "expected_benefit"):
+                if not isinstance(value[field], str) or not value[field].strip():
+                    raise ValueError(f"{field} is required")
+            return ProposalDraft(
+                mutation,
+                value["artifact_id"],
+                value["content"],
+                value["expected_benefit"],
+                tuple(regressions),
+            )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ProviderFailure(
+                ProviderFailureKind.INVALID_RESPONSE,
+                f"unsupported or invalid proposer response: {error}",
             ) from error

@@ -30,12 +30,12 @@ class RunState(str, Enum):
 _ALLOWED_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.PENDING: frozenset({RunState.RUNNING, RunState.FAILED}),
     RunState.RUNNING: frozenset({RunState.COMPLETED, RunState.FAILED}),
-    RunState.COMPLETED: frozenset({RunState.EVALUATED}),
-    RunState.EVALUATED: frozenset({RunState.DIAGNOSED}),
-    RunState.DIAGNOSED: frozenset({RunState.CANDIDATE}),
-    RunState.CANDIDATE: frozenset({RunState.REGRESSED}),
-    RunState.REGRESSED: frozenset({RunState.PROMOTION_PREVIEWED}),
-    RunState.PROMOTION_PREVIEWED: frozenset({RunState.PROMOTED}),
+    RunState.COMPLETED: frozenset({RunState.EVALUATED, RunState.FAILED}),
+    RunState.EVALUATED: frozenset({RunState.DIAGNOSED, RunState.FAILED}),
+    RunState.DIAGNOSED: frozenset({RunState.CANDIDATE, RunState.FAILED}),
+    RunState.CANDIDATE: frozenset({RunState.REGRESSED, RunState.FAILED}),
+    RunState.REGRESSED: frozenset({RunState.PROMOTION_PREVIEWED, RunState.FAILED}),
+    RunState.PROMOTION_PREVIEWED: frozenset({RunState.PROMOTED, RunState.FAILED}),
     RunState.FAILED: frozenset(),
     RunState.PROMOTED: frozenset(),
 }

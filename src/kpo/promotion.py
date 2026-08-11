@@ -7,10 +7,18 @@ import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from kpo.digest import canonical_digest
-from kpo.models import CandidatePatch, MutationKind, RegressionReport
+from kpo.models import CandidatePatch, MutationKind
+
+
+class PromotionReport(Protocol):
+    """The stable report boundary required to create a promotion preview."""
+
+    candidate_digest: str
+    passed: bool
+    digest: str
 
 
 class PromotionInterrupted(RuntimeError):
@@ -103,7 +111,7 @@ class PromotionManager:
     def preview(
         self,
         candidate: CandidatePatch,
-        report: RegressionReport,
+        report: PromotionReport,
         *,
         target_root: Path,
         relative_path: str,

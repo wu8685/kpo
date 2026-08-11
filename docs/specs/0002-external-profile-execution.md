@@ -118,6 +118,17 @@ pass_env = ["EVALUATOR_PROVIDER_KEY"]
   scanner. These rules are defense in depth; provider programs remain
   responsible for not printing secrets.
 
+### 4.3 Command-adapter trust boundary
+
+Command adapters are trusted plugins. KPO passes inline content rather than
+source/profile paths, minimizes the inherited environment, and launches each
+profile provider with a working directory under external `data_home`. Source
+digests are captured before a call and rechecked immediately after exit; drift
+is a typed failure. These controls reduce accidents and detect mutation, but
+cannot prevent a malicious process from writing to paths allowed by the OS
+user. Hard prevention requires an operator-configured container or read-only
+mount.
+
 ## 5. External file schemas
 
 All JSON and JSONL text is UTF-8. Unknown fields are rejected in v0.2 so a
@@ -196,6 +207,9 @@ do not force KPO to collapse dimensions into a scalar score.
 KPO invokes one subprocess for one provider request. Requests are written as a
 single JSON document to standard input. A successful provider writes exactly
 one JSON document to standard output and exits with code zero.
+
+The subprocess working directory is a role-specific directory below
+`data_home/provider-work/`; it is created only when a provider is invoked.
 
 Every request contains:
 
@@ -394,6 +408,8 @@ For `validate-profile`, `run`, `evaluate`, and `status`:
 - no command follows a profile path outside its validated containment boundary.
 
 Tests monitor source-tree digests before and after every command.
+Run and evaluate additionally recheck source digests immediately after each
+provider subprocess exits and transition to `failed` on drift.
 
 ## 11. Acceptance criteria
 

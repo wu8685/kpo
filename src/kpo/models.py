@@ -254,6 +254,34 @@ class CandidatePatch:
     digest: str
 
 
+@dataclass(frozen=True, slots=True)
+class ProposalDraft:
+    mutation: MutationKind
+    artifact_id: str
+    content: str
+    expected_benefit: str
+    possible_regressions: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProposedCandidate:
+    candidate: CandidatePatch
+    expected_benefit: str
+    possible_regressions: tuple[str, ...]
+    proposer_id: str
+    digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedCandidateSummary:
+    candidate_digest: str
+    mutation: MutationKind
+    artifact_id: str
+    validation_deltas: Mapping[str, float]
+    regression_deltas: Mapping[str, float]
+    failed_gates: tuple[str, ...]
+
+
 class Partition(str, Enum):
     TRAIN = "train"
     VALIDATION = "validation"

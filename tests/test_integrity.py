@@ -1,14 +1,107 @@
 from __future__ import annotations
 
+import hashlib
+import os
 from pathlib import Path
 
 import pytest
 
+import kpo.integrity as integrity_module
 from kpo.campaign import initialize_campaign_dataset, run_campaign
-from kpo.integrity import IntegrityViolation
+from kpo.integrity import IntegrityMonitor, IntegrityViolation
 from kpo.runner import run_profile
 from test_campaign import _working_profile
 from test_external_cli import _operational_profile
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_verify_hashes_overlapping_source_and_target_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    source = target / "source.txt"
+    source.write_text("unchanged\n", encoding="utf-8")
+    monitor = IntegrityMonitor(
+        {source: _sha256(source)}, source_root=target, target_root=target
+    )
+    original_digest = integrity_module._digest
+    calls: list[Path] = []
+
+    def counted_digest(path: Path) -> str | None:
+        calls.append(path.resolve())
+        return original_digest(path)
+
+    monkeypatch.setattr(integrity_module, "_digest", counted_digest)
+    monitor.verify()
+
+    assert calls.count(source.resolve()) == 1
+
+
+def test_verify_hashes_target_aliases_once_but_preserves_membership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    physical = target / "physical.txt"
+    physical.write_text("shared\n", encoding="utf-8")
+    alias = target / "alias.txt"
+    try:
+        alias.symlink_to(physical)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    monitor = IntegrityMonitor({}, source_root=tmp_path, target_root=target)
+    assert set(monitor.target_snapshot) == {"alias.txt", "physical.txt"}
+    original_digest = integrity_module._digest
+    calls: list[Path] = []
+
+    def counted_digest(path: Path) -> str | None:
+        calls.append(path.resolve())
+        return original_digest(path)
+
+    monkeypatch.setattr(integrity_module, "_digest", counted_digest)
+    monitor.verify()
+
+    assert calls.count(physical.resolve()) == 1
+
+
+def test_overlapping_source_drift_short_circuits_with_source_name(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    source = target / "source.txt"
+    source.write_text("before\n", encoding="utf-8")
+    monitor = IntegrityMonitor(
+        {source: _sha256(source)}, source_root=target, target_root=target
+    )
+    source.write_text("after!\n", encoding="utf-8")
+
+    with pytest.raises(IntegrityViolation) as captured:
+        monitor.verify()
+
+    assert captured.value.kind == "source_drift"
+    assert captured.value.changed_paths == ("source.txt",)
+
+
+def test_same_size_source_swap_with_restored_mtime_is_detected(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_bytes(b"aaaa")
+    before = source.stat()
+    monitor = IntegrityMonitor({source: _sha256(source)}, source_root=tmp_path)
+    source.write_bytes(b"bbbb")
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = source.stat()
+    assert after.st_size == before.st_size
+    assert after.st_mtime_ns == before.st_mtime_ns
+
+    with pytest.raises(IntegrityViolation) as captured:
+        monitor.verify()
+
+    assert captured.value.kind == "source_drift"
 
 
 def _init(profile: Path) -> None:

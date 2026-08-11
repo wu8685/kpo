@@ -61,16 +61,30 @@ class IntegrityMonitor:
     def _excluded(self, path: Path) -> bool:
         return any(_inside(path, root) for root in self.excluded_roots)
 
-    def _target_snapshot(self) -> dict[str, str]:
+    def _target_paths(self) -> dict[str, Path]:
         if self.target_root is None or not self.target_root.exists():
             return {}
-        result: dict[str, str] = {}
+        result: dict[str, Path] = {}
         for path in sorted(item for item in self.target_root.rglob("*") if item.is_file()):
             resolved = path.resolve()
             if self._excluded(resolved):
                 continue
-            result[path.relative_to(self.target_root).as_posix()] = _digest(path) or "missing"
+            result[path.relative_to(self.target_root).as_posix()] = resolved
         return result
+
+    @staticmethod
+    def _capture(paths: set[Path]) -> dict[Path, str | None]:
+        # Byte hashing is deliberately unconditional. Filesystem metadata must
+        # never become a shortcut in the exact integrity mode.
+        return {path: _digest(path) for path in sorted(paths, key=str)}
+
+    def _target_snapshot(self) -> dict[str, str]:
+        target_paths = self._target_paths()
+        captured = self._capture(set(target_paths.values()))
+        return {
+            relative: captured[path] or "missing"
+            for relative, path in target_paths.items()
+        }
 
     @property
     def target_digest(self) -> str:
@@ -81,18 +95,23 @@ class IntegrityMonitor:
         return digest.hexdigest()
 
     def verify(self) -> None:
+        target_paths = self._target_paths()
+        captured = self._capture(set(self.source_files) | set(target_paths.values()))
         changed_sources = tuple(
             sorted(
                 path.relative_to(self.source_root).as_posix()
                 if _inside(path, self.source_root)
                 else path.name
                 for path, expected in self.source_files.items()
-                if _digest(path) != expected
+                if captured[path] != expected
             )
         )
         if changed_sources:
             raise IntegrityViolation("source_drift", changed_sources)
-        current_target = self._target_snapshot()
+        current_target = {
+            relative: captured[path] or "missing"
+            for relative, path in target_paths.items()
+        }
         if current_target != self.target_snapshot:
             changed = tuple(
                 sorted(

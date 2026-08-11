@@ -1,6 +1,6 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.3 development milestone. KPO can now run finite, budgeted
+> Status: v0.4 development milestone. KPO can run finite, budgeted
 > optimization campaigns over external datasets and produce reviewable policy
 > promotion previews.
 
@@ -88,7 +88,9 @@ operation with an allowlist, diff, snapshot, and journal.
 - matched per-dimension validation, holdout, regression, and ablation gates;
 - persistent provider-call caching, failure records, and resumable failed runs;
 - preview-approved dataset growth with snapshots, journals, and recovery;
-- preview-only campaign promotion with deterministic destination mapping.
+- preview-only campaign promotion with deterministic destination mapping;
+- byte-exact source and target integrity checks that avoid hashing the same
+  physical file twice within one verification pass.
 
 Provider-specific SDK wrappers remain external. A wrapper can connect the
 command protocol to a local model, remote API, Gateway, or existing Agent
@@ -217,3 +219,4 @@ Approved specifications:
 - [v0.1 optimization core](docs/specs/0001-kpo-v0.1.md)
 - [v0.2 external profile execution](docs/specs/0002-external-profile-execution.md)
 - [v0.3 optimization campaign](docs/specs/0003-optimization-campaign.md)
+- [v0.4 exact integrity deduplication](docs/specs/0004-exact-integrity-deduplication.md)

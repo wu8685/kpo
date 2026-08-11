@@ -6,6 +6,7 @@ from typing import Any, Protocol
 from kpo.digest import canonical_digest
 from kpo.models import (
     Evaluation,
+    EvaluatorResult,
     PolicyArtifact,
     PolicySnapshot,
     ReferenceArtifact,
@@ -34,7 +35,7 @@ class ActorProvider(Protocol):
 
 
 class EvaluatorProvider(Protocol):
-    def evaluate(self, request: EvaluatorRequest) -> tuple[ScoreDimension, ...]: ...
+    def evaluate(self, request: EvaluatorRequest) -> EvaluatorResult: ...
 
 
 def run_actor(
@@ -81,10 +82,12 @@ def evaluate_rollout(
         references=references,
         rubric_version=rubric_version,
     )
-    dimensions = provider.evaluate(request)
+    result = provider.evaluate(request)
     return Evaluation.create(
         rollout_digest=rollout.digest,
         evaluator_id=evaluator_id,
         rubric_version=rubric_version,
-        dimensions=dimensions,
+        dimensions=result.dimensions,
+        failure_signals=result.failure_signals,
+        aggregate_score=result.aggregate_score,
     )

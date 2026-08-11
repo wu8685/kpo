@@ -174,6 +174,19 @@ class FailureSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class EvaluatorResult:
+    dimensions: tuple[ScoreDimension, ...]
+    failure_signals: tuple[FailureSignal, ...] = ()
+    aggregate_score: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.dimensions:
+            raise ValueError("evaluator result dimensions are required")
+        if self.aggregate_score is not None and not 0.0 <= self.aggregate_score <= 1.0:
+            raise ValueError("aggregate score must be between 0 and 1")
+
+
+@dataclass(frozen=True, slots=True)
 class Evaluation:
     rollout_digest: str
     evaluator_id: str

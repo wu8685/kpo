@@ -1,7 +1,7 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.1 MVP. The core optimization, regression, safety, and synthetic
-> demonstration paths are implemented and covered by deterministic tests.
+> Status: v0.2 development milestone. The verified optimization core now runs
+> external profiles through isolated command-based Actor and Evaluator adapters.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -76,10 +76,14 @@ operation with an allowlist, diff, snapshot, and journal.
   journals, and interruption recovery;
 - repository and privacy hygiene checks;
 - a deterministic, network-free end-to-end demonstration.
+- strict external TOML profiles with JSON/JSONL manifests;
+- real subprocess provider execution through a versioned JSON protocol;
+- cross-process `run`, `evaluate`, and `status` persistence;
+- source-drift detection, opt-in provider environments, and stderr redaction.
 
-Real model-provider and profile adapters are intentionally outside this first
-MVP. The stable protocols can accept them without placing real policy or domain
-data in this repository.
+Provider-specific SDK wrappers remain external. A wrapper can connect the
+command protocol to a local model, remote API, Gateway, or existing Agent
+runtime without placing real policy or domain data in this repository.
 
 ## Run the synthetic demonstration
 
@@ -116,6 +120,23 @@ rule and replays separate synthetic partitions. Expected summary:
 The remaining output includes content digests and the exact promotion diff.
 The demo never applies that diff.
 
+## Run an external profile
+
+External profiles keep policy, cases, hidden references, provider commands, and
+runtime data outside the KPO checkout. After preparing a profile that follows
+the [v0.2 specification](docs/specs/0002-external-profile-execution.md):
+
+```bash
+uv run kpo validate-profile --profile /path/outside/kpo/profile.toml
+uv run kpo run --profile /path/outside/kpo/profile.toml --case case-001
+uv run kpo evaluate --profile /path/outside/kpo/profile.toml --run RUN_ID
+uv run kpo status --profile /path/outside/kpo/profile.toml --run RUN_ID
+```
+
+`run` does not print the Agent output. `evaluate` loads only the selected case's
+hidden references, and rejects the operation if any recorded source changed
+after the rollout.
+
 ## Verify the repository
 
 ```bash
@@ -139,5 +160,7 @@ KPO follows Spec-Driven Development and Test-Driven Development:
 3. implement the smallest passing behavior;
 4. refactor with regression protection.
 
-The approved v0.1 specification is in
-[`docs/specs/0001-kpo-v0.1.md`](docs/specs/0001-kpo-v0.1.md).
+Approved specifications:
+
+- [v0.1 optimization core](docs/specs/0001-kpo-v0.1.md)
+- [v0.2 external profile execution](docs/specs/0002-external-profile-execution.md)

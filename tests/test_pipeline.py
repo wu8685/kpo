@@ -5,6 +5,7 @@ import pytest
 
 from kpo.models import (
     Evaluation,
+    EvaluatorResult,
     PolicyArtifact,
     PolicySnapshot,
     ReferenceArtifact,
@@ -27,15 +28,15 @@ class RecordingActor:
 class RecordingEvaluator:
     request: EvaluatorRequest | None = None
 
-    def evaluate(self, request: EvaluatorRequest) -> tuple[ScoreDimension, ...]:
+    def evaluate(self, request: EvaluatorRequest) -> EvaluatorResult:
         self.request = request
-        return (
-            ScoreDimension(
+        return EvaluatorResult(
+            dimensions=(ScoreDimension(
                 name="conclusion_alignment",
                 score=1.0,
                 explanation="The route matches the hidden reference.",
                 citations=(request.rollout.digest, request.references[0].artifact_id),
-            ),
+            ),),
         )
 
 

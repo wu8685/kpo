@@ -1,3 +1,4 @@
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -42,3 +43,21 @@ def test_run_state_machine_rejects_invalid_transition(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="invalid run transition"):
         store.transition_run("run-1", RunState.RUNNING)
+
+
+def test_runtime_rejects_unsupported_newer_schema_without_mutation(
+    tmp_path: Path,
+) -> None:
+    data_home = tmp_path / "runtime"
+    store = RuntimeStore(data_home)
+    with sqlite3.connect(store.database_path) as connection:
+        connection.execute("UPDATE runtime_meta SET schema_version = 999")
+
+    with pytest.raises(ValueError, match="newer runtime schema"):
+        RuntimeStore(data_home)
+
+    with sqlite3.connect(store.database_path) as connection:
+        version = connection.execute(
+            "SELECT schema_version FROM runtime_meta"
+        ).fetchone()[0]
+    assert version == 999

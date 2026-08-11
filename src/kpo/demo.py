@@ -9,6 +9,7 @@ from kpo.digest import canonical_json
 from kpo.models import (
     DiagnosisKind,
     Evaluation,
+    EvaluatorResult,
     FailureSignal,
     MutationKind,
     Partition,
@@ -36,7 +37,7 @@ class SyntheticActor:
 
 
 class SyntheticEvaluator:
-    def evaluate(self, request: EvaluatorRequest) -> tuple[ScoreDimension, ...]:
+    def evaluate(self, request: EvaluatorRequest) -> EvaluatorResult:
         aligned = "abstain" in request.rollout.output.casefold()
         score = 1.0 if aligned else 0.2
         explanation = (
@@ -44,8 +45,8 @@ class SyntheticEvaluator:
             if aligned
             else "The conclusion ignores the required conflict boundary."
         )
-        return (
-            ScoreDimension(
+        return EvaluatorResult(
+            dimensions=(ScoreDimension(
                 name="conclusion_alignment",
                 score=score,
                 explanation=explanation,
@@ -53,7 +54,7 @@ class SyntheticEvaluator:
                     request.rollout.digest,
                     request.references[0].artifact_id,
                 ),
-            ),
+            ),),
         )
 
 

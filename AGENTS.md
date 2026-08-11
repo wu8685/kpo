@@ -68,6 +68,29 @@ Do not write implementation code for an unapproved new component. Python is the
 initial implementation language, but public contracts must remain language- and
 provider-neutral.
 
+## Delegated continuous iteration
+
+When the project owner delegates intermediate checks and decisions to an ahsir
+reviewer, use an independent, persistent, read-only reviewer for specification,
+implementation, experiment, data-growth, and promotion-candidate gates.
+
+- The implementer supplies the exact acceptance criteria and evidence; the
+  reviewer returns `APPROVED`, `CHANGES`, or `BLOCKED`.
+- `CHANGES` means revise and resubmit in the same persistent review context.
+- `APPROVED` permits the next previously specified, reversible development
+  step. It does not authorize broader external effects.
+- Continue incremental, evidence-backed iterations until the current acceptance
+  target is met or the owner says to stop.
+- The reviewer cannot approve its own changes and cannot edit the repository,
+  promote knowledge, publish, push, spend money, or disclose private data.
+- Credentials, meaningful external cost, real or private data leaving its
+  approved boundary, destructive or irreversible operations, changes to the
+  project's core objective, and the final target-quality decision remain with
+  the human owner.
+- Growing a dataset must preserve explicit partitions, provenance, deduplication,
+  contamination checks, and a frozen holdout. More examples alone are not
+  evidence of improvement.
+
 ## Git and publication
 
 The remote is `https://github.com/wu8685/kpo`.

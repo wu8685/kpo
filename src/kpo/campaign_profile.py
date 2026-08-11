@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import tomllib
@@ -11,6 +12,8 @@ from types import MappingProxyType
 from typing import Mapping
 
 from kpo.dataset import DatasetManifest, load_dataset
+from kpo.digest import canonical_digest
+from kpo.integrity import IntegrityMonitor
 from kpo.models import CandidatePatch, MutationKind
 from kpo.profile import (
     CommandProviderConfig,
@@ -24,6 +27,7 @@ from kpo.vector_regression import VectorGates
 
 
 _ARTIFACT_FILENAME = re.compile(r"^[A-Za-z0-9._-]+$")
+_CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,7 +44,60 @@ class CampaignProfile:
     allowlist: tuple[str, ...]
     add_directory: str
     policy_paths: Mapping[str, str]
+    policy_manifest_path: Path
     sandbox_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class PromotionDestination:
+    target_relative_path: str
+    manifest_relative_path: str
+
+
+def validate_campaign_id(value: str) -> str:
+    if not isinstance(value, str) or not _CAMPAIGN_ID.fullmatch(value):
+        raise ValueError("campaign ID must be a safe path component")
+    return value
+
+
+def campaign_profile_snapshot(profile: CampaignProfile) -> str:
+    commands = (profile.base.actor, profile.base.evaluator, profile.proposer)
+    return canonical_digest(
+        {
+            "profile_sources": profile.base.source_digests,
+            "dataset_digest": profile.dataset.digest,
+            "commands": [
+                {
+                    "config": command,
+                    "executable_digest": hashlib.sha256(
+                        Path(command.command[0]).read_bytes()
+                    ).hexdigest(),
+                }
+                for command in commands
+            ],
+            "gates": profile.gates,
+            "promotion": {
+                "target_root": profile.target_root,
+                "allowlist": profile.allowlist,
+                "add_directory": profile.add_directory,
+            },
+        }
+    )
+
+
+def campaign_integrity_monitor(profile: CampaignProfile) -> IntegrityMonitor:
+    return IntegrityMonitor.from_relative_digests(
+        profile.base.path.parent,
+        profile.base.source_digests,
+        extra_files=(
+            profile.dataset_path,
+            Path(profile.base.actor.command[0]),
+            Path(profile.base.evaluator.command[0]),
+            Path(profile.proposer.command[0]),
+        ),
+        target_root=profile.target_root,
+        excluded_roots=(profile.base.data_home,),
+    )
 
 
 def _positive_integer(value: object, label: str) -> int:
@@ -134,6 +191,9 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
     )
     if not target_root.is_dir():
         raise ValueError("promotion.target_root must exist")
+    profile_root = root.resolve()
+    if target_root != profile_root and profile_root not in target_root.parents:
+        raise ValueError("promotion.target_root must resolve inside profile directory")
     allowlist_raw = promotion.get("allowlist")
     if not isinstance(allowlist_raw, list) or not allowlist_raw:
         raise ValueError("promotion.allowlist is required")
@@ -142,7 +202,10 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         promotion.get("add_directory"), "promotion.add_directory"
     )
     add_path = Path(add_directory)
-    if not any(add_path == Path(prefix) or Path(prefix) in add_path.parents for prefix in allowlist):
+    if not any(
+        add_path == Path(prefix) or Path(prefix) in add_path.parents
+        for prefix in allowlist
+    ):
         raise ValueError("promotion.add_directory must be inside allowlist")
 
     policy_paths: dict[str, str] = {}
@@ -176,17 +239,25 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         allowlist=allowlist,
         add_directory=add_directory,
         policy_paths=MappingProxyType(policy_paths),
+        policy_manifest_path=policy_manifest,
         sandbox_type=sandbox_type,
     )
 
 
 def resolve_candidate_destination(
     profile: CampaignProfile, candidate: CandidatePatch
-) -> str:
+) -> PromotionDestination:
+    profile_root = profile.base.path.parent.resolve()
+    target_root = profile.target_root.resolve()
     if candidate.mutation is MutationKind.EDIT:
         if candidate.artifact_id not in profile.policy_paths:
             raise ValueError("edit candidate artifact_id has no policy path")
-        return profile.policy_paths[candidate.artifact_id]
+        manifest_relative = Path(profile.policy_paths[candidate.artifact_id])
+        resolved = (profile_root / manifest_relative).resolve()
+        try:
+            target_relative = resolved.relative_to(target_root)
+        except ValueError as error:
+            raise ValueError("edit candidate path is not below promotion target_root") from error
     if candidate.mutation is MutationKind.ADD:
         artifact_id = candidate.artifact_id
         if (
@@ -195,5 +266,19 @@ def resolve_candidate_destination(
             or ".." in Path(artifact_id).parts
         ):
             raise ValueError("candidate artifact_id is not a safe filename")
-        return (Path(profile.add_directory) / f"{artifact_id}.md").as_posix()
-    raise ValueError(f"unsupported candidate mutation: {candidate.mutation.value}")
+        target_relative = Path(profile.add_directory) / f"{artifact_id}.md"
+        target_prefix = target_root.relative_to(profile_root)
+        manifest_relative = target_prefix / target_relative
+    elif candidate.mutation is not MutationKind.EDIT:
+        raise ValueError(f"unsupported candidate mutation: {candidate.mutation.value}")
+
+    target_resolved = (target_root / target_relative).resolve()
+    manifest_resolved = (profile_root / manifest_relative).resolve()
+    if target_resolved != manifest_resolved:
+        raise ValueError("promotion destination coordinate mismatch")
+    if target_resolved != target_root and target_root not in target_resolved.parents:
+        raise ValueError("promotion destination escapes target_root")
+    return PromotionDestination(
+        target_relative_path=target_relative.as_posix(),
+        manifest_relative_path=manifest_relative.as_posix(),
+    )

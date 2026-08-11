@@ -1,8 +1,8 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.4 development milestone. KPO can run finite, budgeted
-> optimization campaigns over external datasets and produce reviewable policy
-> promotion previews.
+> Status: v0.5 development milestone. KPO can run finite, budgeted
+> optimization campaigns, persist reviewable promotion transactions, and
+> explicitly apply or recover approved policy updates.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -88,7 +88,12 @@ operation with an allowlist, diff, snapshot, and journal.
 - matched per-dimension validation, holdout, regression, and ablation gates;
 - persistent provider-call caching, failure records, and resumable failed runs;
 - preview-approved dataset growth with snapshots, journals, and recovery;
-- preview-only campaign promotion with deterministic destination mapping;
+- immutable campaign promotion bundles containing both policy-content and
+  policy-manifest diffs;
+- explicit digest-approved `promote` apply with a persistent lock, journaled
+  two-file transaction, and interruption recovery;
+- natural campaign chaining: the next ordinary campaign reloads the applied
+  policy as its parent;
 - byte-exact source and target integrity checks that avoid hashing the same
   physical file twice within one verification pass.
 
@@ -191,6 +196,32 @@ The holdout partition cannot be added to, removed from, edited, reweighted, or
 repartitioned after initialization. A passing campaign stops at a promotion
 preview; applying that change remains a separate consequential decision.
 
+Review and apply a passing campaign as separate commands:
+
+```bash
+# Revalidate the immutable bundle and print both diffs plus its approval digest.
+uv run kpo promote \
+  --profile /path/outside/kpo/profile.toml \
+  --campaign CAMPAIGN_ID
+
+# Apply exactly the reviewed content + manifest transaction.
+uv run kpo promote \
+  --profile /path/outside/kpo/profile.toml \
+  --campaign CAMPAIGN_ID \
+  --approve APPROVAL_DIGEST
+
+# Only after an interrupted apply leaves the persistent lock in place.
+uv run kpo promote \
+  --profile /path/outside/kpo/profile.toml \
+  --campaign CAMPAIGN_ID \
+  --recover
+```
+
+The approval digest binds the candidate, report and policy digests, both
+relative paths, exact original/reviewed bytes, and both displayed diffs. KPO
+never infers this value for a real profile. Recovery restores an interrupted
+prepared transaction; it does not roll back a committed promotion.
+
 ## Verify the repository
 
 ```bash
@@ -220,3 +251,4 @@ Approved specifications:
 - [v0.2 external profile execution](docs/specs/0002-external-profile-execution.md)
 - [v0.3 optimization campaign](docs/specs/0003-optimization-campaign.md)
 - [v0.4 exact integrity deduplication](docs/specs/0004-exact-integrity-deduplication.md)
+- [v0.5 external promotion and chaining](docs/specs/0005-external-promotion-and-chaining.md)

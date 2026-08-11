@@ -123,10 +123,80 @@ def test_candidate_destination_is_deterministic_and_safe(tmp_path: Path) -> None
     edit = CandidatePatch("p", "d", MutationKind.EDIT, "base", "content", ("x",), "c")
     unsafe = CandidatePatch("p", "d", MutationKind.ADD, "../escape", "content", ("x",), "c")
 
-    assert resolve_candidate_destination(profile, add) == "policies/new-rule.md"
-    assert resolve_candidate_destination(profile, edit) == "policy/base.md"
+    assert resolve_candidate_destination(profile, add).target_relative_path == "policies/new-rule.md"
+    assert resolve_candidate_destination(profile, add).manifest_relative_path == "policies/new-rule.md"
+    assert resolve_candidate_destination(profile, edit).target_relative_path == "policy/base.md"
+    assert resolve_candidate_destination(profile, edit).manifest_relative_path == "policy/base.md"
     with pytest.raises(ValueError, match="artifact_id"):
         resolve_candidate_destination(profile, unsafe)
+
+
+def test_candidate_destination_maps_nested_target_coordinates(tmp_path: Path) -> None:
+    path = _campaign_profile(tmp_path / "external")
+    nested = path.parent / "knowledge"
+    nested.mkdir()
+    text = path.read_text(encoding="utf-8").replace(
+        'target_root = "."', 'target_root = "./knowledge"'
+    )
+    path.write_text(text, encoding="utf-8")
+    profile = load_campaign_profile(path, checkout=Path(__file__).parents[1])
+    add = CandidatePatch("p", "d", MutationKind.ADD, "new-rule", "content", ("x",), "c")
+
+    destination = resolve_candidate_destination(profile, add)
+
+    assert destination.target_relative_path == "policies/new-rule.md"
+    assert destination.manifest_relative_path == "knowledge/policies/new-rule.md"
+    assert (profile.target_root / destination.target_relative_path).resolve() == (
+        profile.base.path.parent / destination.manifest_relative_path
+    ).resolve()
+
+
+def test_campaign_profile_rejects_target_outside_profile_or_symlink_escape(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_path = _campaign_profile(tmp_path / "outside-profile")
+    outside_path.write_text(
+        outside_path.read_text(encoding="utf-8").replace(
+            'target_root = "."', f'target_root = "{outside}"'
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="inside profile"):
+        load_campaign_profile(outside_path, checkout=Path(__file__).parents[1])
+
+    symlink_path = _campaign_profile(tmp_path / "symlink-profile")
+    link = symlink_path.parent / "linked-target"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symlinks are unavailable")
+    symlink_path.write_text(
+        symlink_path.read_text(encoding="utf-8").replace(
+            'target_root = "."', 'target_root = "./linked-target"'
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="inside profile"):
+        load_campaign_profile(symlink_path, checkout=Path(__file__).parents[1])
+
+
+def test_edit_candidate_must_resolve_below_target_root(tmp_path: Path) -> None:
+    path = _campaign_profile(tmp_path / "external")
+    nested = path.parent / "knowledge"
+    nested.mkdir()
+    path.write_text(
+        path.read_text(encoding="utf-8").replace(
+            'target_root = "."', 'target_root = "./knowledge"'
+        ),
+        encoding="utf-8",
+    )
+    profile = load_campaign_profile(path, checkout=Path(__file__).parents[1])
+    edit = CandidatePatch("p", "d", MutationKind.EDIT, "base", "content", ("x",), "c")
+
+    with pytest.raises(ValueError, match="below promotion target_root"):
+        resolve_candidate_destination(profile, edit)
 
 
 def test_unavailable_hard_sandbox_is_rejected(tmp_path: Path) -> None:

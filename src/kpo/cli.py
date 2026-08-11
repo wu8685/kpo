@@ -10,6 +10,11 @@ from kpo.demo import run_synthetic_demo
 from kpo.campaign import campaign_status, initialize_campaign_dataset, run_campaign
 from kpo.campaign_profile import load_campaign_profile
 from kpo.dataset import DatasetManager, load_dataset
+from kpo.external_promotion import (
+    apply_campaign_promotion,
+    preview_campaign_promotion,
+    recover_campaign_promotion,
+)
 from kpo.hygiene import scan_repository
 from kpo.profile import load_profile
 from kpo.runner import evaluate_profile_run, profile_summary, run_profile, run_status
@@ -76,6 +81,15 @@ def _parser() -> argparse.ArgumentParser:
     campaign_status_parser.add_argument("--profile", type=Path, required=True)
     campaign_status_parser.add_argument("--campaign", required=True)
     campaign_status_parser.add_argument("--checkout", type=Path, default=Path.cwd())
+    promote = subcommands.add_parser(
+        "promote", help="preview, apply, or recover a campaign promotion"
+    )
+    promote.add_argument("--profile", type=Path, required=True)
+    promote.add_argument("--campaign", required=True)
+    promotion_action = promote.add_mutually_exclusive_group()
+    promotion_action.add_argument("--approve")
+    promotion_action.add_argument("--recover", action="store_true")
+    promote.add_argument("--checkout", type=Path, default=Path.cwd())
     return parser
 
 
@@ -172,6 +186,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = campaign_status(
             args.profile, args.campaign, checkout=args.checkout
         )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.command == "promote":
+        if args.recover:
+            result = recover_campaign_promotion(
+                args.profile, args.campaign, checkout=args.checkout
+            )
+        elif args.approve is not None:
+            result = apply_campaign_promotion(
+                args.profile,
+                args.campaign,
+                checkout=args.checkout,
+                approval_digest=args.approve,
+            )
+        else:
+            result = preview_campaign_promotion(
+                args.profile, args.campaign, checkout=args.checkout
+            )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
     if args.command == "validate-profile":

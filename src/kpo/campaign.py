@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import tempfile
@@ -12,12 +11,20 @@ from typing import Any
 from kpo.campaign_cache import BudgetExhausted, CampaignCallExecutor
 from kpo.campaign_profile import (
     CampaignProfile,
+    campaign_integrity_monitor,
+    campaign_profile_snapshot,
     load_campaign_profile,
     resolve_candidate_destination,
+    validate_campaign_id,
 )
 from kpo.dataset import DatasetManager
 from kpo.diagnosis import diagnose
 from kpo.digest import canonical_digest
+from kpo.external_promotion import (
+    persist_promotion_bundle,
+    propose_manifest_update,
+    resume_campaign_promotion_preview,
+)
 from kpo.models import (
     Diagnosis,
     Evaluation,
@@ -49,40 +56,15 @@ class CampaignInterrupted(RuntimeError):
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = (json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    payload = (
+        json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
     with tempfile.NamedTemporaryFile(mode="wb", dir=path.parent, delete=False) as tmp:
         tmp.write(payload)
         tmp.flush()
         os.fsync(tmp.fileno())
         temporary = Path(tmp.name)
     os.replace(temporary, path)
-
-
-def _file_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _profile_snapshot(profile: CampaignProfile) -> str:
-    commands = (profile.base.actor, profile.base.evaluator, profile.proposer)
-    return canonical_digest(
-        {
-            "profile_sources": profile.base.source_digests,
-            "dataset_digest": profile.dataset.digest,
-            "commands": [
-                {
-                    "config": command,
-                    "executable_digest": _file_digest(Path(command.command[0])),
-                }
-                for command in commands
-            ],
-            "gates": profile.gates,
-            "promotion": {
-                "target_root": profile.target_root,
-                "allowlist": profile.allowlist,
-                "add_directory": profile.add_directory,
-            },
-        }
-    )
 
 
 def initialize_campaign_dataset(
@@ -228,6 +210,7 @@ def run_campaign(
     campaign_id: str | None = None,
     resume: bool = False,
     fault_after_train: bool = False,
+    fault_after_bundle: bool = False,
 ) -> dict[str, Any]:
     profile = load_campaign_profile(profile_path, checkout=checkout)
     dataset_manager = DatasetManager(profile.base.data_home)
@@ -237,25 +220,30 @@ def run_campaign(
         and profile.frozen_holdout_digest != f"sha256:{profile.dataset.holdout_digest}"
     ):
         raise ValueError("profile frozen_holdout_digest does not match dataset")
-    campaign_id = campaign_id or uuid.uuid4().hex
+    campaign_id = validate_campaign_id(campaign_id or uuid.uuid4().hex)
     path = _state_path(profile, campaign_id)
-    snapshot_digest = _profile_snapshot(profile)
-    monitor = IntegrityMonitor.from_relative_digests(
-        profile.base.path.parent,
-        profile.base.source_digests,
-        extra_files=(
-            profile.dataset_path,
-            Path(profile.base.actor.command[0]),
-            Path(profile.base.evaluator.command[0]),
-            Path(profile.proposer.command[0]),
-        ),
-        target_root=profile.target_root,
-        excluded_roots=(profile.base.data_home,),
-    )
+    snapshot_digest = campaign_profile_snapshot(profile)
+    monitor = campaign_integrity_monitor(profile)
     target_digest = monitor.target_digest
 
     if path.exists():
         state = json.loads(path.read_text(encoding="utf-8"))
+        bundle_directory = (
+            profile.base.data_home
+            / "promotions"
+            / "previews"
+            / campaign_id
+        )
+        if (
+            resume
+            and state["state"] in {"running", "failed"}
+            and bundle_directory.exists()
+        ):
+            state.update(
+                resume_campaign_promotion_preview(profile, campaign_id, state)
+            )
+            _atomic_json(path, state)
+            return state
         if not resume or state["state"] != "failed":
             raise ValueError("only failed campaigns may be resumed")
         if state["profile_snapshot_digest"] != snapshot_digest:
@@ -270,6 +258,7 @@ def run_campaign(
             "state": "running",
             "iteration": 0,
             "profile_snapshot_digest": snapshot_digest,
+            "parent_policy_digest": profile.base.policy.digest,
             "target_digest": target_digest,
             "rejected_candidates": [],
             "sandbox": profile.sandbox_type,
@@ -359,24 +348,53 @@ def run_campaign(
                 profile.gates,
             )
             if report.passed:
-                relative = resolve_candidate_destination(profile, candidate)
+                destination = resolve_candidate_destination(profile, candidate)
                 monitor.verify()
                 preview = PromotionManager(profile.base.data_home / "promotion").preview(
                     candidate,
                     report,
                     target_root=profile.target_root,
-                    relative_path=relative,
+                    relative_path=destination.target_relative_path,
                     allowlist=profile.allowlist,
                 )
+                manifest_preview = propose_manifest_update(
+                    profile, candidate, destination
+                )
+                bundle_path = persist_promotion_bundle(
+                    profile,
+                    campaign_id=campaign_id,
+                    profile_snapshot_digest=snapshot_digest,
+                    target_digest=target_digest,
+                    candidate=candidate,
+                    report=report,
+                    destination=destination,
+                    content_preview=preview,
+                    manifest_preview=manifest_preview,
+                )
+                if fault_after_bundle:
+                    state.update(
+                        state="failed",
+                        call_count=executor.call_count,
+                        rejected_candidate_count=len(rejected),
+                    )
+                    _atomic_json(path, state)
+                    raise CampaignInterrupted(campaign_id)
                 state.update(
                     state="promotion_previewed",
+                    promotion_state="previewed",
                     iteration=iteration + 1,
                     call_count=executor.call_count,
                     candidate_digest=candidate.digest,
+                    candidate_policy_digest=report.candidate_policy_digest,
                     report_digest=report.digest,
                     report_passed=True,
                     promotion_diff=preview.diff,
                     promotion_diff_digest=preview.diff_digest,
+                    manifest_diff=manifest_preview.diff,
+                    manifest_diff_digest=manifest_preview.diff_digest,
+                    bundle_path=bundle_path.relative_to(
+                        profile.base.data_home
+                    ).as_posix(),
                     rejected_candidate_count=len(rejected),
                 )
                 _atomic_json(path, state)

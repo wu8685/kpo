@@ -73,6 +73,29 @@ def test_campaign_passes_to_preview_without_writing_target(tmp_path: Path) -> No
     assert result["report_passed"] is True
     assert result["call_count"] > 0
     assert "Improved rule" in result["promotion_diff"]
+    assert "new-rule" not in result["promotion_diff"]
+    assert "improved-rule" in result["manifest_diff"]
+    assert result["promotion_state"] == "previewed"
+    assert "approval_digest" not in result
+    assert result["candidate_policy_digest"]
+    bundle_path = profile.parent / "runtime" / result["bundle_path"]
+    assert bundle_path.name == "bundle.json"
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    assert bundle["schema_version"] == 1
+    assert bundle["campaign_id"] == result["campaign_id"]
+    assert bundle["candidate"]["artifact_id"] == "improved-rule"
+    assert bundle["candidate_digest"] == result["candidate_digest"]
+    assert bundle["candidate_policy_digest"] == result["candidate_policy_digest"]
+    assert bundle["target_relative_path"] == "policies/improved-rule.md"
+    assert bundle["manifest_relative_path"] == "policies/improved-rule.md"
+    assert "approval_digest" not in bundle
+    bundle_dir = bundle_path.parent
+    assert not (bundle_dir / "original-content.bin").exists()
+    assert (bundle_dir / "reviewed-content.bin").read_bytes() == b"Improved rule."
+    assert (bundle_dir / "original-manifest.jsonl").read_bytes() == (
+        profile.parent / "policy.jsonl"
+    ).read_bytes()
+    assert b"improved-rule" in (bundle_dir / "reviewed-manifest.jsonl").read_bytes()
     assert not (profile.parent / "policies" / "improved-rule.md").exists()
     assert (profile.parent / "policy" / "base.md").read_bytes() == policy_before
     status = campaign_status(
@@ -107,6 +130,18 @@ def test_provider_call_budget_stops_campaign(tmp_path: Path) -> None:
     result = run_campaign(profile, checkout=Path(__file__).parents[1])
     assert result["state"] == "budget_exhausted"
     assert result["call_count"] == 1
+
+
+def test_campaign_rejects_unsafe_explicit_campaign_id(tmp_path: Path) -> None:
+    profile = _working_profile(tmp_path / "external")
+    _initialize(profile)
+
+    with pytest.raises(ValueError, match="campaign ID"):
+        run_campaign(
+            profile,
+            checkout=Path(__file__).parents[1],
+            campaign_id="../escape",
+        )
 
 
 def test_campaign_rejects_profile_holdout_digest_mismatch(tmp_path: Path) -> None:
@@ -149,6 +184,44 @@ def test_failed_campaign_resume_reuses_completed_calls(tmp_path: Path) -> None:
     # Train calls are cache hits on resume; only later stages add calls.
     assert resumed["call_count"] > calls_after_failure
     assert resumed["call_count"] < calls_after_failure * 2 + 20
+
+
+def test_campaign_resume_finalizes_installed_bundle_without_provider_calls(
+    tmp_path: Path,
+) -> None:
+    profile = _working_profile(tmp_path / "external")
+    _initialize(profile)
+    with pytest.raises(CampaignInterrupted) as captured:
+        run_campaign(
+            profile,
+            checkout=Path(__file__).parents[1],
+            fault_after_bundle=True,
+        )
+    campaign_id = captured.value.campaign_id
+    data_home = profile.parent / "runtime"
+    budget_path = data_home / "campaigns" / campaign_id / "call-budget.json"
+    budget_before = budget_path.read_bytes()
+    interrupted = campaign_status(
+        profile, campaign_id, checkout=Path(__file__).parents[1]
+    )
+    assert interrupted["state"] == "failed"
+    assert (data_home / "promotions" / "previews" / campaign_id / "bundle.json").is_file()
+
+    resumed = run_campaign(
+        profile,
+        checkout=Path(__file__).parents[1],
+        campaign_id=campaign_id,
+        resume=True,
+    )
+
+    assert budget_path.read_bytes() == budget_before
+    assert resumed["state"] == "promotion_previewed"
+    assert resumed["promotion_state"] == "previewed"
+    assert resumed["call_count"] == json.loads(budget_before)["call_count"]
+    assert resumed["promotion_diff"]
+    assert resumed["manifest_diff"]
+    assert resumed["bundle_path"]
+    assert "approval_digest" not in resumed
 
 
 def test_campaign_cli_initializes_runs_and_reports_status(
@@ -198,6 +271,11 @@ def test_campaign_cli_initializes_runs_and_reports_status(
     ) == 0
     status = json.loads(capsys.readouterr().out)
     assert status["state"] == "promotion_previewed"
+    assert status["promotion_state"] == "previewed"
+    assert status["promotion_diff"]
+    assert status["manifest_diff"]
+    assert status["bundle_path"]
+    assert "approval_digest" not in status
 
 
 def test_campaign_evaluates_all_train_cases_before_selecting_diagnosis(

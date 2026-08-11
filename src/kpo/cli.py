@@ -3,24 +3,32 @@ from __future__ import annotations
 import argparse
 import json
 import tomllib
+import uuid
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
-from kpo.demo import run_synthetic_demo
 from kpo.campaign import campaign_status, initialize_campaign_dataset, run_campaign
 from kpo.campaign_profile import load_campaign_profile
-from kpo.dataset import DatasetManager, load_dataset
-from kpo.external_promotion import (
-    apply_campaign_promotion,
-    preview_campaign_promotion,
-    recover_campaign_promotion,
+from kpo.campaign_series import (
+    initialize_series,
+    reconcile_series,
+    series_evidence_report,
+    series_status,
+    stop_series,
 )
+from kpo.dataset import DatasetManager, load_dataset
+from kpo.demo import run_synthetic_demo
 from kpo.evaluator_agreement import load_agreement_report
 from kpo.evaluator_calibration import (
     apply_anchor_approval,
     preview_anchor_approval,
 )
 from kpo.evaluator_drift import compare_profile_evaluator_drift
+from kpo.external_promotion import (
+    apply_campaign_promotion,
+    preview_campaign_promotion,
+    recover_campaign_promotion,
+)
 from kpo.hygiene import scan_repository
 from kpo.profile import load_profile
 from kpo.runner import evaluate_profile_run, profile_summary, run_profile, run_status
@@ -87,7 +95,18 @@ def _parser() -> argparse.ArgumentParser:
     campaign = subcommands.add_parser("campaign", help="run an optimization campaign")
     campaign.add_argument("--profile", type=Path, required=True)
     campaign.add_argument("--resume")
+    campaign.add_argument("--series")
     campaign.add_argument("--checkout", type=Path, default=Path.cwd())
+
+    series = subcommands.add_parser("series", help="manage a campaign series")
+    series_commands = series.add_subparsers(dest="series_command", required=True)
+    for name in ("init", "status", "evidence", "reconcile", "stop"):
+        command = series_commands.add_parser(name)
+        command.add_argument("--profile", type=Path, required=True)
+        command.add_argument("--series", required=name != "init")
+        command.add_argument("--checkout", type=Path, default=Path.cwd())
+        if name == "evidence":
+            command.add_argument("--full", action="store_true")
     campaign_status_parser = subcommands.add_parser(
         "campaign-status", help="inspect a campaign"
     )
@@ -164,6 +183,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
+    if args.command == "series":
+        profile = load_campaign_profile(args.profile, checkout=args.checkout)
+        series_id = args.series or uuid.uuid4().hex
+        if args.series_command == "init":
+            result = initialize_series(profile, series_id)
+        elif args.series_command == "status":
+            result = series_status(profile, series_id)
+        elif args.series_command == "evidence":
+            result = series_evidence_report(profile, series_id, full=args.full)
+        elif args.series_command == "reconcile":
+            result = reconcile_series(profile, series_id)
+        elif args.series_command == "stop":
+            result = stop_series(profile, series_id)
+        else:
+            raise AssertionError(f"unhandled series command: {args.series_command}")
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     if args.command == "dataset":
         if args.dataset_command == "init":
             result = initialize_campaign_dataset(
@@ -219,6 +255,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.profile,
             checkout=args.checkout,
             campaign_id=args.resume,
+            series_id=args.series,
             resume=args.resume is not None,
         )
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))

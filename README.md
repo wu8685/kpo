@@ -1,8 +1,9 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.7 development milestone. KPO can measure Evaluator agreement,
-> calibration against approved synthetic anchors, and cross-campaign drift
-> while keeping all measurement evidence outside the repository.
+> Status: v0.8 development milestone. KPO can organize immutable Campaign
+> series, preserve failed/resumed revision history, and report privacy-safe
+> aggregate learning curves while keeping runtime evidence outside the
+> repository.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -110,6 +111,17 @@ operation with an allowlist, diff, snapshot, and journal.
   per-anchor observations;
 - read-only cross-campaign Evaluator drift comparison using the target
   campaign's historical thresholds rather than the current profile;
+- optional Campaign series with a stable semantic contract, frozen holdout,
+  unique-Campaign safety budget, and verified dynamic policy lineage;
+- immutable per-revision Campaign evidence, including append-only history when
+  a failed Campaign resumes without consuming another Campaign slot;
+- deterministic aggregate learning curves segmented across approved dataset
+  growth, cumulative applied holdout gains, and advisory diminishing-return or
+  holdout-degradation indicators;
+- explicit series reconciliation and mutation locks for crash-safe allocation,
+  evidence append, owner stop, and interrupted-allocation recovery;
+- privacy-reviewed agreement and calibration trends that never expose per-case
+  or per-anchor observations;
 - byte-exact source and target integrity checks that avoid hashing the same
   physical file twice within one verification pass.
 
@@ -257,6 +269,47 @@ changes, missing evidence, and whether a change strictly exceeds the threshold
 stored by the target campaign. It never prints per-anchor digests, expected
 scores, or raw Evaluator scores.
 
+## Organize campaigns into a series
+
+An optional `[series]` profile section binds multiple Campaigns to one stable
+evaluation contract while allowing approved policy promotion and non-holdout
+dataset growth between Campaigns:
+
+```toml
+[series]
+max_campaigns = 6
+
+[series.stopping]
+min_improvement = 0.01
+patience = 2
+holdout_degradation = 0.05
+```
+
+Create a series, run Campaigns, and inspect aggregate evidence:
+
+```bash
+uv run kpo series init \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID
+
+uv run kpo campaign \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID
+
+uv run kpo series status \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID
+
+uv run kpo series evidence \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID
+```
+
+Use `series evidence --full` to include immutable failed/resumed revision
+history. `series reconcile` repairs a verified terminal-state/append crash gap
+without Provider calls. Quality indicators are advisory; `max_campaigns` and
+an explicit owner stop are enforced before new Provider work.
+
 Dataset expansion follows the same preview/approval rule:
 
 ```bash
@@ -329,3 +382,4 @@ Approved specifications:
 - [v0.5 external promotion and chaining](docs/specs/0005-external-promotion-and-chaining.md)
 - [v0.6 Evaluator agreement audit](docs/specs/0006-evaluator-agreement-audit.md)
 - [v0.7 Evaluator calibration and drift](docs/specs/0007-evaluator-calibration-and-drift.md)
+- [v0.8 Campaign series orchestration](docs/specs/0008-campaign-series-orchestration.md)

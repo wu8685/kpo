@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
@@ -17,18 +18,24 @@ from kpo.campaign_profile import (
     resolve_candidate_destination,
     validate_campaign_id,
 )
+from kpo.campaign_series import (
+    SeriesEntry,
+    append_series_entry,
+    effective_series_entries,
+    expected_series_parent,
+    load_series_state,
+    persist_campaign_series_evidence,
+    reconcile_series,
+    series_mutation,
+)
 from kpo.dataset import DatasetManager
 from kpo.diagnosis import diagnose
 from kpo.digest import canonical_digest
-from kpo.external_promotion import (
-    persist_promotion_bundle,
-    propose_manifest_update,
-    resume_campaign_promotion_preview,
-)
 from kpo.evaluator_agreement import (
-    AgreementCollector,
     AgreementCheckpointError,
+    AgreementCollector,
     AgreementPersistenceError,
+    _validate_report_schema,
     cleanup_agreement_checkpoint,
     evaluation_event_id,
     load_agreement_checkpoint,
@@ -42,6 +49,12 @@ from kpo.evaluator_audit_runtime import (
     run_evaluator_calibration,
 )
 from kpo.evaluator_calibration_report import EvaluatorCalibrationPersistenceError
+from kpo.external_promotion import (
+    persist_promotion_bundle,
+    propose_manifest_update,
+    resume_campaign_promotion_preview,
+)
+from kpo.integrity import IntegrityViolation
 from kpo.models import (
     Diagnosis,
     Evaluation,
@@ -52,7 +65,6 @@ from kpo.models import (
     Rollout,
     TaskCase,
 )
-from kpo.integrity import IntegrityMonitor, IntegrityViolation
 from kpo.pipeline import evaluate_rollout, run_actor, run_proposer
 from kpo.promotion import PromotionManager
 from kpo.provider import (
@@ -61,7 +73,6 @@ from kpo.provider import (
     CommandProposerProvider,
     ProviderFailure,
 )
-from kpo.regression import apply_candidate
 from kpo.vector_regression import VectorRegressionReport, run_vector_regression
 
 
@@ -262,6 +273,128 @@ def _state_path(profile: CampaignProfile, campaign_id: str) -> Path:
     return profile.base.data_home / "campaigns" / campaign_id / "campaign.json"
 
 
+def _persist_series_terminal(
+    profile: CampaignProfile,
+    state: dict[str, Any],
+    path: Path,
+    *,
+    report: VectorRegressionReport | None,
+) -> dict[str, Any]:
+    series_id = state.get("series_id")
+    if series_id is None:
+        _atomic_json(path, state)
+        return state
+    report_bindings = dict(state)
+    if (
+        state.get("evaluator_agreement_digest") is not None
+        and state.get("evaluator_agreement_report_digest") is None
+    ):
+        agreement_path = (
+            profile.base.data_home
+            / "campaigns"
+            / state["campaign_id"]
+            / "evaluator-agreement.json"
+        )
+        agreement_payload = agreement_path.read_bytes()
+        agreement_report = _validate_report_schema(
+            json.loads(agreement_payload.decode("utf-8"))
+        )
+        if (
+            hashlib.sha256(agreement_payload).hexdigest()
+            != state["evaluator_agreement_digest"]
+            or agreement_report["campaign_id"] != state["campaign_id"]
+            or agreement_report["profile_snapshot_digest"]
+            != state["profile_snapshot_digest"]
+        ):
+            raise ValueError("series agreement report binding mismatch")
+        report_bindings["evaluator_agreement_report_digest"] = (
+            agreement_report["report_digest"]
+        )
+    binding = persist_campaign_series_evidence(
+        profile,
+        series_id=series_id,
+        series_index=state["series_index"],
+        campaign_id=state["campaign_id"],
+        revision=state["series_evidence_revision"],
+        terminal_state=state["state"],
+        profile_snapshot_digest=state["profile_snapshot_digest"],
+        iteration_count=state.get("iteration", 0),
+        call_count=state.get("call_count", 0),
+        rejected_candidate_count=state.get("rejected_candidate_count", 0),
+        report=report,
+        report_bindings=report_bindings,
+    )
+    state.update(
+        series_evidence_path=binding["path"],
+        series_evidence_digest=binding["byte_digest"],
+        series_evidence_record_digest=binding["record_digest"],
+    )
+    _atomic_json(path, state)
+    append_series_entry(
+        profile,
+        series_id,
+        SeriesEntry(
+            index=state["series_index"],
+            campaign_id=state["campaign_id"],
+            revision=state["series_evidence_revision"],
+            campaign_state=state["state"],
+            parent_policy_digest=state["parent_policy_digest"],
+            candidate_policy_digest=state.get("candidate_policy_digest"),
+            dataset_digest=profile.dataset.digest,
+            profile_snapshot_digest=state["profile_snapshot_digest"],
+            evidence_path=binding["path"],
+            evidence_digest=binding["byte_digest"],
+            evidence_record_digest=binding["record_digest"],
+        ),
+    )
+    return state
+
+
+def _series_report_record(report: VectorRegressionReport) -> dict[str, Any]:
+    return {
+        "candidate_digest": report.candidate_digest,
+        "parent_policy_digest": report.parent_policy_digest,
+        "candidate_policy_digest": report.candidate_policy_digest,
+        "partition_gains": {
+            partition.value: dict(report.partition_gains[partition])
+            for partition in (
+                Partition.VALIDATION,
+                Partition.HOLDOUT,
+                Partition.REGRESSION,
+            )
+        },
+        "ablation_gains": dict(report.ablation_gains),
+        "passed": report.passed,
+        "digest": report.digest,
+    }
+
+
+def _series_report_from_record(record: Any) -> VectorRegressionReport:
+    if not isinstance(record, dict):
+        raise ValueError("series resume report is missing")
+    return VectorRegressionReport(
+        candidate_digest=record["candidate_digest"],
+        parent_policy_digest=record["parent_policy_digest"],
+        candidate_policy_digest=record["candidate_policy_digest"],
+        measurements=(),
+        partition_gains=MappingProxyType(
+            {
+                partition: MappingProxyType(
+                    dict(record["partition_gains"][partition.value])
+                )
+                for partition in (
+                    Partition.VALIDATION,
+                    Partition.HOLDOUT,
+                    Partition.REGRESSION,
+                )
+            }
+        ),
+        ablation_gains=MappingProxyType(dict(record["ablation_gains"])),
+        passed=record["passed"],
+        digest=record["digest"],
+    )
+
+
 def _rejections(raw: list[dict[str, Any]]) -> tuple[RejectedCandidateSummary, ...]:
     from kpo.models import MutationKind
 
@@ -311,6 +444,7 @@ def run_campaign(
     *,
     checkout: Path,
     campaign_id: str | None = None,
+    series_id: str | None = None,
     resume: bool = False,
     fault_after_train: bool = False,
     fault_after_bundle: bool = False,
@@ -330,9 +464,49 @@ def run_campaign(
     monitor = campaign_integrity_monitor(profile)
     target_digest = monitor.target_digest
 
+    series_index: int | None = None
+    series_state: dict[str, Any] | None = None
+    if series_id is not None:
+        validate_campaign_id(series_id)
+        if profile.series is None:
+            raise ValueError("campaign profile has no series configuration")
+        if resume:
+            series_state = load_series_state(profile, series_id)
+            if series_state["state"] != "active":
+                raise ValueError(f"campaign series is {series_state['state']}")
+            expected_parent = expected_series_parent(profile, series_state)
+            if profile.base.policy.digest != expected_parent:
+                raise ValueError("series policy lineage mismatch")
+
     existing_campaign = path.exists()
     if existing_campaign:
         state = json.loads(path.read_text(encoding="utf-8"))
+        if series_id is not None:
+            assert series_state is not None
+            if (
+                state.get("series_id") != series_id
+                or state.get("series_contract_digest")
+                != series_state["series_contract_digest"]
+            ):
+                raise ValueError("campaign series binding mismatch")
+            attached = [
+                entry
+                for entry in series_state["entries"]
+                if entry["campaign_id"] == campaign_id
+            ]
+            if attached:
+                latest = attached[-1]
+                if latest["campaign_state"] != "failed":
+                    raise ValueError("campaign revision is not in failed state")
+                if (
+                    latest["index"] != state.get("series_index")
+                    or latest["revision"]
+                    != state.get("series_evidence_revision")
+                ):
+                    raise ValueError("campaign series revision binding mismatch")
+                state["series_evidence_revision"] = latest["revision"] + 1
+            elif state.get("series_evidence_revision") != 0:
+                raise ValueError("campaign series revision binding mismatch")
         bundle_directory = (
             profile.base.data_home
             / "promotions"
@@ -347,7 +521,23 @@ def run_campaign(
             state.update(
                 resume_campaign_promotion_preview(profile, campaign_id, state)
             )
-            _atomic_json(path, state)
+            if series_id is None:
+                _atomic_json(path, state)
+            else:
+                report = _series_report_from_record(
+                    state.pop("series_pending_report", None)
+                )
+                if (
+                    report.digest != state.get("report_digest")
+                    or report.candidate_digest != state.get("candidate_digest")
+                    or report.candidate_policy_digest
+                    != state.get("candidate_policy_digest")
+                    or report.parent_policy_digest
+                    != state.get("parent_policy_digest")
+                    or report.passed is not True
+                ):
+                    raise ValueError("series resume report binding mismatch")
+                _persist_series_terminal(profile, state, path, report=report)
             cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
             return state
         if not resume or state["state"] != "failed":
@@ -369,7 +559,39 @@ def run_campaign(
             "rejected_candidates": [],
             "sandbox": profile.sandbox_type,
         }
-        _atomic_json(path, state)
+        if series_id is not None:
+            with series_mutation(
+                profile,
+                series_id,
+                operation="allocation",
+                campaign_id=campaign_id,
+            ) as update_lock:
+                reconcile_series(profile, series_id, _locked=True)
+                series_state = load_series_state(profile, series_id)
+                if series_state["state"] != "active":
+                    raise ValueError(f"campaign series is {series_state['state']}")
+                expected_parent = expected_series_parent(profile, series_state)
+                if profile.base.policy.digest != expected_parent:
+                    raise ValueError("series policy lineage mismatch")
+                campaign_count = len(effective_series_entries(series_state))
+                if campaign_count >= series_state["max_campaigns"]:
+                    raise ValueError("campaign series max_campaigns is exhausted")
+                series_index = campaign_count
+                state.update(
+                    series_id=series_id,
+                    series_index=series_index,
+                    series_evidence_revision=0,
+                    series_contract_digest=series_state[
+                        "series_contract_digest"
+                    ],
+                )
+                update_lock(
+                    series_index=series_index,
+                    initial_state_digest=canonical_digest(state),
+                )
+                _atomic_json(path, state)
+        else:
+            _atomic_json(path, state)
 
     if profile.evaluator_audit is not None:
         try:
@@ -384,21 +606,21 @@ def run_campaign(
                 state="failed",
                 failure_kind="evaluator_calibration_approval",
             )
-            _atomic_json(path, state)
+            _persist_series_terminal(profile, state, path, report=None)
             return state
         except (EvaluatorCalibrationCheckpointError, EvaluatorAuditBudgetError):
             state.update(
                 state="failed",
                 failure_kind="evaluator_calibration_checkpoint",
             )
-            _atomic_json(path, state)
+            _persist_series_terminal(profile, state, path, report=None)
             return state
         except EvaluatorCalibrationPersistenceError:
             state.update(
                 state="failed",
                 failure_kind="evaluator_calibration_persistence",
             )
-            _atomic_json(path, state)
+            _persist_series_terminal(profile, state, path, report=None)
             return state
         state.update(**calibration_binding)
         _atomic_json(path, state)
@@ -442,7 +664,7 @@ def run_campaign(
                 state="failed",
                 failure_kind="evaluator_agreement_checkpoint",
             )
-            _atomic_json(path, state)
+            _persist_series_terminal(profile, state, path, report=None)
             return state
     rejected = list(_rejections(state.get("rejected_candidates", [])))
     seen = {item.candidate_digest for item in rejected}
@@ -490,7 +712,7 @@ def run_campaign(
                     rejected_candidate_count=len(rejected),
                     **binding,
                 )
-                _atomic_json(path, state)
+                _persist_series_terminal(profile, state, path, report=None)
                 cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
                 return state
 
@@ -528,7 +750,7 @@ def run_campaign(
                     rejected_candidate_count=len(rejected),
                     **binding,
                 )
-                _atomic_json(path, state)
+                _persist_series_terminal(profile, state, path, report=None)
                 cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
                 return state
             seen.add(candidate.digest)
@@ -560,6 +782,9 @@ def run_campaign(
                 profile.gates,
             )
             if report.passed:
+                if state.get("series_id") is not None:
+                    state["series_pending_report"] = _series_report_record(report)
+                    _atomic_json(path, state)
                 binding = _agreement_binding(
                     profile,
                     collector,
@@ -628,7 +853,8 @@ def run_campaign(
                     rejected_candidate_count=len(rejected),
                     **binding,
                 )
-                _atomic_json(path, state)
+                state.pop("series_pending_report", None)
+                _persist_series_terminal(profile, state, path, report=report)
                 cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
                 return state
 
@@ -664,7 +890,7 @@ def run_campaign(
                 collection_state="budget_exhausted",
             ),
         )
-        _atomic_json(path, state)
+        _persist_series_terminal(profile, state, path, report=None)
         cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
         return state
     except BudgetExhausted:
@@ -682,7 +908,7 @@ def run_campaign(
                 call_count=executor.call_count,
                 failure_kind="evaluator_agreement_persistence",
             )
-            _atomic_json(path, state)
+            _persist_series_terminal(profile, state, path, report=None)
             return state
         state.update(
             state="budget_exhausted",
@@ -690,10 +916,27 @@ def run_campaign(
             rejected_candidate_count=len(rejected),
             **binding,
         )
-        _atomic_json(path, state)
+        _persist_series_terminal(profile, state, path, report=None)
         cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
         return state
     except CampaignInterrupted:
+        revision = state.get("series_evidence_revision", 0)
+        if (
+            not isinstance(revision, int)
+            or isinstance(revision, bool)
+            or revision < 0
+        ):
+            raise ValueError("campaign series revision is invalid")
+        suffix = "" if revision == 0 else f".{revision}"
+        expected_evidence_path = (
+            f"campaigns/{campaign_id}/series-evidence{suffix}.json"
+        )
+        if (
+            state.get("series_id") is not None
+            and state.get("series_evidence_path") != expected_evidence_path
+        ):
+            state.setdefault("call_count", executor.call_count)
+            _persist_series_terminal(profile, state, path, report=None)
         raise
     except IntegrityViolation as error:
         state.update(
@@ -702,7 +945,7 @@ def run_campaign(
             failure_kind=error.kind,
             changed_paths=list(error.changed_paths),
         )
-        _atomic_json(path, state)
+        _persist_series_terminal(profile, state, path, report=None)
         return state
     except ProviderFailure as error:
         state.update(
@@ -710,7 +953,7 @@ def run_campaign(
             call_count=executor.call_count,
             failure_kind=error.kind.value,
         )
-        _atomic_json(path, state)
+        _persist_series_terminal(profile, state, path, report=None)
         return state
     except AgreementPersistenceError:
         state.update(
@@ -718,7 +961,7 @@ def run_campaign(
             call_count=executor.call_count,
             failure_kind="evaluator_agreement_persistence",
         )
-        _atomic_json(path, state)
+        _persist_series_terminal(profile, state, path, report=None)
         return state
     except AgreementCheckpointError:
         state.update(
@@ -726,7 +969,7 @@ def run_campaign(
             call_count=executor.call_count,
             failure_kind="evaluator_agreement_checkpoint",
         )
-        _atomic_json(path, state)
+        _persist_series_terminal(profile, state, path, report=None)
         return state
     except BaseException:
         state.update(state="failed", call_count=executor.call_count)

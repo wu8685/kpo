@@ -7,13 +7,13 @@ import os
 import re
 import shutil
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 from kpo.models import PolicyArtifact, PolicySnapshot, ReferenceArtifact, TaskCase
-
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _OBSERVER_NAME = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
@@ -195,6 +195,7 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
             "campaign",
             "promotion",
             "sandbox",
+            "series",
         },
         label="profile",
     )

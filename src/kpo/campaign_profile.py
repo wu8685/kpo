@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import re
 import tomllib
-from dataclasses import replace
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping
 
 from kpo.dataset import DatasetManifest, load_dataset
 from kpo.digest import canonical_digest
@@ -26,9 +25,16 @@ from kpo.profile import (
 )
 from kpo.vector_regression import VectorGates
 
-
 _ARTIFACT_FILENAME = re.compile(r"^[A-Za-z0-9._-]+$")
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
+
+
+@dataclass(frozen=True, slots=True)
+class SeriesConfig:
+    max_campaigns: int
+    min_improvement: float | None
+    patience: int | None
+    holdout_degradation: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +54,7 @@ class CampaignProfile:
     policy_manifest_path: Path
     sandbox_type: str
     evaluator_audit: EvaluatorAuditConfig | None
+    series: SeriesConfig | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +144,68 @@ def _positive_integer(value: object, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{label} must be a positive integer")
     return value
+
+
+def _unit_float(value: object, label: str) -> float:
+    if (
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        or not 0 <= value <= 1
+    ):
+        raise ValueError(f"{label} must be finite and between zero and one")
+    return float(value)
+
+
+def _series_config(raw: object) -> SeriesConfig | None:
+    if raw is None:
+        return None
+    section = _strict(raw, {"max_campaigns", "stopping"}, label="series")
+    stopping_raw = section.get("stopping")
+    if stopping_raw is None:
+        minimum = None
+        patience = None
+        degradation = None
+    else:
+        stopping = _strict(
+            stopping_raw,
+            {"min_improvement", "patience", "holdout_degradation"},
+            label="series.stopping",
+        )
+        has_minimum = "min_improvement" in stopping
+        has_patience = "patience" in stopping
+        if has_minimum != has_patience:
+            raise ValueError(
+                "series.stopping min_improvement and patience must be configured together"
+            )
+        minimum = (
+            _unit_float(
+                stopping["min_improvement"], "series.stopping.min_improvement"
+            )
+            if has_minimum
+            else None
+        )
+        patience = (
+            _positive_integer(stopping["patience"], "series.stopping.patience")
+            if has_patience
+            else None
+        )
+        degradation = (
+            _unit_float(
+                stopping["holdout_degradation"],
+                "series.stopping.holdout_degradation",
+            )
+            if "holdout_degradation" in stopping
+            else None
+        )
+    return SeriesConfig(
+        max_campaigns=_positive_integer(
+            section.get("max_campaigns"), "series.max_campaigns"
+        ),
+        min_improvement=minimum,
+        patience=patience,
+        holdout_degradation=degradation,
+    )
 
 
 def _gate(raw: object, names: set[str], label: str) -> Mapping[str, float]:
@@ -260,6 +329,7 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
     evaluator_audit = load_evaluator_audit(
         raw.get("evaluator_audit"), profile=base
     )
+    series = _series_config(raw.get("series"))
     return CampaignProfile(
         base=base,
         dataset=dataset,
@@ -278,6 +348,7 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         policy_manifest_path=policy_manifest,
         sandbox_type=sandbox_type,
         evaluator_audit=evaluator_audit,
+        series=series,
     )
 
 

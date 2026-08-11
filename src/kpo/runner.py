@@ -31,6 +31,11 @@ def profile_summary(profile: ExternalProfile) -> dict[str, Any]:
         "rubric_dimensions": list(profile.rubric.dimension_names),
         "actor_adapter": "command",
         "evaluator_adapter": "command",
+        "observer_evaluator_count": len(profile.observer_evaluators),
+        "observer_evaluators": [
+            {"name": observer.name, "evaluator_id": observer.config.identity}
+            for observer in profile.observer_evaluators
+        ],
     }
 
 

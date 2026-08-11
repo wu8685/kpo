@@ -62,6 +62,75 @@ def _initialize(profile: Path) -> None:
     )
 
 
+def _add_observers(profile: Path) -> tuple[Path, Path, Path]:
+    root = profile.parent
+    capture_root = root / "runtime" / "captures"
+    capture_root.mkdir(parents=True)
+    offset_capture = capture_root / "offset-requests.jsonl"
+    failure_capture = capture_root / "failure-requests.jsonl"
+    proposer_capture = capture_root / "proposer-request.json"
+    offset = root / "bin" / "observer-offset"
+    offset.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,sys\n"
+        "from pathlib import Path\n"
+        "r=json.load(sys.stdin)['request']\n"
+        f"p=Path({str(offset_capture)!r}); p.write_text((p.read_text() if p.exists() else '')+json.dumps(r,sort_keys=True)+'\\n')\n"
+        "improved=r['rollout']['output']=='improved'; score=1.0 if improved else 0.4\n"
+        "rollout=r['rollout']['digest']; ref=r['references'][0]['artifact_id']\n"
+        "json.dump({'dimensions':[{'name':'alignment','score':score,'explanation':'observer','citations':[rollout,ref]}],'failure_signals':[],'aggregate_score':score},sys.stdout)\n",
+        encoding="utf-8",
+    )
+    offset.chmod(0o755)
+    failure = root / "bin" / "observer-failure"
+    failure.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,sys\n"
+        "from pathlib import Path\n"
+        "r=json.load(sys.stdin)['request']\n"
+        f"p=Path({str(failure_capture)!r}); p.write_text((p.read_text() if p.exists() else '')+json.dumps(r,sort_keys=True)+'\\n')\n"
+        "sys.exit(3) if r['case_id']=='case-2' else None\n"
+        "improved=r['rollout']['output']=='improved'; score=1.0 if improved else 0.2\n"
+        "rollout=r['rollout']['digest']; ref=r['references'][0]['artifact_id']\n"
+        "json.dump({'dimensions':[{'name':'alignment','score':score,'explanation':'observer','citations':[rollout,ref]}],'failure_signals':[],'aggregate_score':score},sys.stdout)\n",
+        encoding="utf-8",
+    )
+    failure.chmod(0o755)
+    proposer = root / "bin" / "proposer"
+    proposer.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json,sys\n"
+        "from pathlib import Path\n"
+        "r=json.load(sys.stdin)\n"
+        f"Path({str(proposer_capture)!r}).write_text(json.dumps(r,sort_keys=True))\n"
+        "assert 'holdout' not in json.dumps(r).lower()\n"
+        "json.dump({'mutation':'add','artifact_id':'improved-rule','content':'Improved rule.','expected_benefit':'improve','possible_regressions':[]},sys.stdout)\n",
+        encoding="utf-8",
+    )
+    proposer.chmod(0o755)
+    with profile.open("a", encoding="utf-8") as stream:
+        stream.write(
+            '''
+[[observer_evaluators]]
+name = "observer-offset"
+adapter = "command"
+command = ["./bin/observer-offset"]
+evaluator_id = "offset-model"
+timeout_seconds = 10
+pass_env = []
+
+[[observer_evaluators]]
+name = "observer-failure"
+adapter = "command"
+command = ["./bin/observer-failure"]
+evaluator_id = "failure-model"
+timeout_seconds = 10
+pass_env = []
+'''
+        )
+    return offset_capture, failure_capture, proposer_capture
+
+
 def test_campaign_passes_to_preview_without_writing_target(tmp_path: Path) -> None:
     profile = _working_profile(tmp_path / "external")
     _initialize(profile)
@@ -130,6 +199,298 @@ def test_provider_call_budget_stops_campaign(tmp_path: Path) -> None:
     result = run_campaign(profile, checkout=Path(__file__).parents[1])
     assert result["state"] == "budget_exhausted"
     assert result["call_count"] == 1
+
+
+def test_observers_produce_isolated_agreement_report_without_changing_gates(
+    tmp_path: Path,
+) -> None:
+    profile = _working_profile(tmp_path / "external")
+    offset_capture, failure_capture, proposer_capture = _add_observers(profile)
+    _initialize(profile)
+
+    result = run_campaign(
+        profile,
+        checkout=Path(__file__).parents[1],
+        campaign_id="observer-campaign",
+    )
+
+    assert result["state"] == "promotion_previewed"
+    assert result["evaluator_agreement_digest"]
+    assert result["evaluator_agreement_summary"]["observer_count"] == 2
+    report_path = profile.parent / "runtime" / result["evaluator_agreement_path"]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["protocol"] == "kpo.evaluator-agreement/v1"
+    assert report["collection_state"] == "complete"
+    assert report["event_count"] == 7
+    assert report["event_counts"] == {
+        "holdout": 2,
+        "regression": 2,
+        "train": 1,
+        "validation": 2,
+    }
+    assert report["availability"] == {
+        "observer-failure": {"non_zero_exit": 2}
+    }
+    assert "case-" not in json.dumps(report)
+    for capture in (offset_capture, failure_capture):
+        requests = [json.loads(line) for line in capture.read_text().splitlines()]
+        assert requests
+        assert all("dimensions" not in request for request in requests)
+        assert all("promotion" not in json.dumps(request) for request in requests)
+        assert all("observer-offset" not in json.dumps(request) for request in requests)
+        assert all("observer-failure" not in json.dumps(request) for request in requests)
+    proposer_request = proposer_capture.read_text(encoding="utf-8")
+    assert "observer-offset" not in proposer_request
+    assert "observer-failure" not in proposer_request
+    assert "evaluator_agreement" not in proposer_request
+
+
+def test_observer_budget_exhaustion_records_unattempted_slots(tmp_path: Path) -> None:
+    profile = _working_profile(tmp_path / "external")
+    _add_observers(profile)
+    profile.write_text(
+        profile.read_text(encoding="utf-8").replace(
+            "max_provider_calls = 100", "max_provider_calls = 2"
+        ),
+        encoding="utf-8",
+    )
+    _initialize(profile)
+
+    result = run_campaign(profile, checkout=Path(__file__).parents[1])
+
+    assert result["state"] == "budget_exhausted"
+    report_path = profile.parent / "runtime" / result["evaluator_agreement_path"]
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["collection_state"] == "budget_exhausted"
+    assert report["event_count"] == 1
+    assert report["availability"] == {
+        "observer-failure": {"not_attempted_budget_exhausted": 1},
+        "observer-offset": {"not_attempted_budget_exhausted": 1},
+    }
+
+
+def test_repeated_observer_campaign_candidate_persists_complete_report(
+    tmp_path: Path,
+) -> None:
+    profile = _working_profile(tmp_path / "external", candidate_score=0.25)
+    _add_observers(profile)
+    _initialize(profile)
+
+    result = run_campaign(profile, checkout=Path(__file__).parents[1])
+
+    assert result["state"] == "no_patchable_diagnosis"
+    report = json.loads(
+        (profile.parent / "runtime" / result["evaluator_agreement_path"]).read_text()
+    )
+    assert report["collection_state"] == "complete"
+
+
+def test_evaluator_agreement_cli_is_read_only_and_strict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile = _working_profile(tmp_path / "external")
+    _add_observers(profile)
+    _initialize(profile)
+    result = run_campaign(
+        profile,
+        checkout=Path(__file__).parents[1],
+        campaign_id="audit-cli",
+    )
+    data_home = profile.parent / "runtime"
+    report_path = data_home / result["evaluator_agreement_path"]
+    state_path = data_home / "campaigns" / "audit-cli" / "campaign.json"
+    protected = {
+        path: path.read_bytes()
+        for path in (
+            report_path,
+            state_path,
+            profile.parent / "policy.jsonl",
+            profile.parent / "dataset.jsonl",
+            profile.parent / "policy" / "base.md",
+        )
+    }
+
+    assert (
+        main(
+            [
+                "evaluator-agreement",
+                "--profile",
+                str(profile),
+                "--campaign",
+                "audit-cli",
+                "--checkout",
+                str(Path(__file__).parents[1]),
+            ]
+        )
+        == 0
+    )
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["report_digest"]
+    assert all(path.read_bytes() == content for path, content in protected.items())
+
+    original_report = json.loads(report_path.read_text(encoding="utf-8"))
+    report_path.write_text(
+        json.dumps(original_report | {"unexpected": True}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="unknown agreement report fields"):
+        main(
+            [
+                "evaluator-agreement",
+                "--profile",
+                str(profile),
+                "--campaign",
+                "audit-cli",
+                "--checkout",
+                str(Path(__file__).parents[1]),
+            ]
+        )
+    report_path.write_bytes(protected[report_path])
+
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state_path.write_text(
+        json.dumps(state | {"evaluator_agreement_path": "../escape.json"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="path"):
+        main(
+            [
+                "evaluator-agreement",
+                "--profile",
+                str(profile),
+                "--campaign",
+                "audit-cli",
+                "--checkout",
+                str(Path(__file__).parents[1]),
+            ]
+        )
+    state_path.write_bytes(protected[state_path])
+
+
+@pytest.mark.parametrize("max_calls", [100, 2])
+def test_agreement_persistence_failure_prevents_clean_terminal_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_calls: int,
+) -> None:
+    from kpo.evaluator_agreement import AgreementPersistenceError
+
+    profile = _working_profile(tmp_path / f"external-{max_calls}")
+    _add_observers(profile)
+    profile.write_text(
+        profile.read_text(encoding="utf-8").replace(
+            "max_provider_calls = 100", f"max_provider_calls = {max_calls}"
+        ),
+        encoding="utf-8",
+    )
+    _initialize(profile)
+
+    def fail_persistence(*args: object, **kwargs: object) -> dict[str, object]:
+        raise AgreementPersistenceError("injected")
+
+    monkeypatch.setattr("kpo.campaign.persist_agreement_report", fail_persistence)
+
+    result = run_campaign(profile, checkout=Path(__file__).parents[1])
+
+    assert result["state"] == "failed"
+    assert result["failure_kind"] == "evaluator_agreement_persistence"
+
+
+def test_multi_iteration_resume_restores_prior_observer_events_from_checkpoint(
+    tmp_path: Path,
+) -> None:
+    profile = _working_profile(tmp_path / "external", candidate_score=0.25)
+    _add_observers(profile)
+    _initialize(profile)
+    with pytest.raises(CampaignInterrupted) as interrupted:
+        run_campaign(
+            profile,
+            checkout=Path(__file__).parents[1],
+            campaign_id="checkpoint-resume",
+            fault_after_rejection=True,
+        )
+    campaign_id = interrupted.value.campaign_id
+    checkpoint = (
+        profile.parent
+        / "runtime"
+        / "campaigns"
+        / campaign_id
+        / "evaluator-agreement.checkpoint.json"
+    )
+    assert checkpoint.is_file()
+
+    resumed = run_campaign(
+        profile,
+        checkout=Path(__file__).parents[1],
+        campaign_id=campaign_id,
+        resume=True,
+    )
+
+    assert resumed["state"] == "no_patchable_diagnosis"
+    report = json.loads(
+        (profile.parent / "runtime" / resumed["evaluator_agreement_path"]).read_text()
+    )
+    assert report["event_count"] == 7
+    assert report["event_counts"] == {
+        "holdout": 2,
+        "regression": 2,
+        "train": 1,
+        "validation": 2,
+    }
+    assert not checkpoint.exists()
+
+
+def test_missing_observer_checkpoint_makes_resume_a_typed_failure(
+    tmp_path: Path,
+) -> None:
+    profile = _working_profile(tmp_path / "external", candidate_score=0.25)
+    _add_observers(profile)
+    _initialize(profile)
+    with pytest.raises(CampaignInterrupted) as interrupted:
+        run_campaign(
+            profile,
+            checkout=Path(__file__).parents[1],
+            campaign_id="missing-checkpoint",
+            fault_after_rejection=True,
+        )
+    campaign_id = interrupted.value.campaign_id
+    checkpoint = (
+        profile.parent
+        / "runtime"
+        / "campaigns"
+        / campaign_id
+        / "evaluator-agreement.checkpoint.json"
+    )
+    checkpoint.unlink()
+
+    resumed = run_campaign(
+        profile,
+        checkout=Path(__file__).parents[1],
+        campaign_id=campaign_id,
+        resume=True,
+    )
+
+    assert resumed["state"] == "failed"
+    assert resumed["failure_kind"] == "evaluator_agreement_checkpoint"
+
+
+def test_checkpoint_initialization_failure_is_typed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from kpo.evaluator_agreement import AgreementCheckpointError
+
+    profile = _working_profile(tmp_path / "external")
+    _add_observers(profile)
+    _initialize(profile)
+
+    def fail_checkpoint(*args: object, **kwargs: object) -> Path:
+        raise AgreementCheckpointError("injected")
+
+    monkeypatch.setattr("kpo.campaign.persist_agreement_checkpoint", fail_checkpoint)
+
+    result = run_campaign(profile, checkout=Path(__file__).parents[1])
+
+    assert result["state"] == "failed"
+    assert result["failure_kind"] == "evaluator_agreement_checkpoint"
 
 
 def test_campaign_rejects_unsafe_explicit_campaign_id(tmp_path: Path) -> None:

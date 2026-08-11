@@ -8,7 +8,7 @@ import pytest
 from kpo.cli import main
 from kpo.profile import load_profile
 from kpo.runner import evaluate_profile_run, run_profile
-from test_profile import _write_profile
+from test_profile import _append_observer, _write_profile
 
 
 def _operational_profile(root: Path) -> Path:
@@ -48,6 +48,23 @@ def test_validate_profile_does_not_create_runtime(
 
     assert result["profile_id"] == "example"
     assert result["case_count"] == 1
+    assert not (profile_path.parent / "runtime").exists()
+
+
+def test_validate_profile_reports_observer_identities_without_runtime_values(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    profile_path = _operational_profile(tmp_path / "external-observers")
+    _append_observer(profile_path, "observer-a", "observer-model")
+
+    assert main(["validate-profile", "--profile", str(profile_path)]) == 0
+    result = json.loads(capsys.readouterr().out)
+
+    assert result["observer_evaluator_count"] == 1
+    assert result["observer_evaluators"] == [
+        {"name": "observer-a", "evaluator_id": "observer-model"}
+    ]
+    assert "pass_env" not in json.dumps(result)
     assert not (profile_path.parent / "runtime").exists()
 
 

@@ -75,6 +75,16 @@ def campaign_profile_snapshot(profile: CampaignProfile) -> str:
                 }
                 for command in commands
             ],
+            "observers": [
+                {
+                    "name": observer.name,
+                    "config": observer.config,
+                    "executable_digest": hashlib.sha256(
+                        Path(observer.config.command[0]).read_bytes()
+                    ).hexdigest(),
+                }
+                for observer in profile.base.observer_evaluators
+            ],
             "gates": profile.gates,
             "promotion": {
                 "target_root": profile.target_root,
@@ -94,6 +104,10 @@ def campaign_integrity_monitor(profile: CampaignProfile) -> IntegrityMonitor:
             Path(profile.base.actor.command[0]),
             Path(profile.base.evaluator.command[0]),
             Path(profile.proposer.command[0]),
+            *(
+                Path(observer.config.command[0])
+                for observer in profile.base.observer_evaluators
+            ),
         ),
         target_root=profile.target_root,
         excluded_roots=(profile.base.data_home,),

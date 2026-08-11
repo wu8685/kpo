@@ -25,6 +25,16 @@ from kpo.external_promotion import (
     propose_manifest_update,
     resume_campaign_promotion_preview,
 )
+from kpo.evaluator_agreement import (
+    AgreementCollector,
+    AgreementCheckpointError,
+    AgreementPersistenceError,
+    cleanup_agreement_checkpoint,
+    evaluation_event_id,
+    load_agreement_checkpoint,
+    persist_agreement_checkpoint,
+    persist_agreement_report,
+)
 from kpo.models import (
     Diagnosis,
     Evaluation,
@@ -123,6 +133,9 @@ def _evaluate_case(
     case: TaskCase,
     policy: PolicySnapshot,
     executor: CampaignCallExecutor,
+    *,
+    partition: Partition,
+    collector: AgreementCollector | None = None,
 ) -> tuple[Rollout, Evaluation]:
     references = _references(profile, case)
     actor_context = _call_context(
@@ -152,7 +165,90 @@ def _evaluate_case(
         evaluator_id=profile.base.evaluator.identity,
         rubric_version=profile.base.rubric.rubric_version,
     )
+    if collector is not None:
+        event_id = evaluation_event_id(
+            case_digest=canonical_digest(case),
+            rollout_digest=rollout.digest,
+            policy_digest=policy.digest,
+            partition=partition.value,
+            rubric_digest=canonical_digest(profile.base.rubric),
+        )
+        collector.record_primary(
+            event_id,
+            partition.value,
+            {item.name: item.score for item in evaluation.dimensions},
+        )
+        observers = profile.base.observer_evaluators
+        for index, observer in enumerate(observers):
+            try:
+                observed = evaluate_rollout(
+                    case,
+                    rollout,
+                    references,
+                    CommandEvaluatorProvider(
+                        observer.config,
+                        profile.base.rubric,
+                        executor=executor,
+                        context=evaluator_context,
+                    ),
+                    evaluator_id=observer.config.identity,
+                    rubric_version=profile.base.rubric.rubric_version,
+                )
+            except BudgetExhausted:
+                for remaining in observers[index:]:
+                    collector.record_unavailable(
+                        event_id,
+                        remaining.name,
+                        "not_attempted_budget_exhausted",
+                    )
+                raise
+            except ProviderFailure as error:
+                collector.record_unavailable(event_id, observer.name, error.kind.value)
+                continue
+            collector.record_observer(
+                event_id,
+                observer.name,
+                {item.name: item.score for item in observed.dimensions},
+            )
     return rollout, evaluation
+
+
+def _agreement_binding(
+    profile: CampaignProfile,
+    collector: AgreementCollector | None,
+    campaign_id: str,
+    snapshot_digest: str,
+    *,
+    collection_state: str,
+) -> dict[str, Any]:
+    if collector is None:
+        return {}
+    report = collector.report(
+        campaign_id=campaign_id,
+        profile_id=profile.base.profile_id,
+        profile_snapshot_digest=snapshot_digest,
+        collection_state=collection_state,
+    )
+    return persist_agreement_report(
+        profile.base.data_home,
+        campaign_id,
+        report,
+    )
+
+
+def _persist_agreement_checkpoint(
+    profile: CampaignProfile,
+    collector: AgreementCollector | None,
+    campaign_id: str,
+    snapshot_digest: str,
+) -> None:
+    if collector is not None:
+        persist_agreement_checkpoint(
+            profile.base.data_home,
+            campaign_id,
+            collector,
+            profile_snapshot_digest=snapshot_digest,
+        )
 
 
 def _state_path(profile: CampaignProfile, campaign_id: str) -> Path:
@@ -211,6 +307,7 @@ def run_campaign(
     resume: bool = False,
     fault_after_train: bool = False,
     fault_after_bundle: bool = False,
+    fault_after_rejection: bool = False,
 ) -> dict[str, Any]:
     profile = load_campaign_profile(profile_path, checkout=checkout)
     dataset_manager = DatasetManager(profile.base.data_home)
@@ -226,7 +323,8 @@ def run_campaign(
     monitor = campaign_integrity_monitor(profile)
     target_digest = monitor.target_digest
 
-    if path.exists():
+    existing_campaign = path.exists()
+    if existing_campaign:
         state = json.loads(path.read_text(encoding="utf-8"))
         bundle_directory = (
             profile.base.data_home
@@ -243,6 +341,7 @@ def run_campaign(
                 resume_campaign_promotion_preview(profile, campaign_id, state)
             )
             _atomic_json(path, state)
+            cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
             return state
         if not resume or state["state"] != "failed":
             raise ValueError("only failed campaigns may be resumed")
@@ -271,6 +370,40 @@ def run_campaign(
         max_calls=profile.max_provider_calls,
         integrity_check=monitor.verify,
     )
+    observer_coordinates = tuple(
+        (observer.name, observer.config.identity)
+        for observer in profile.base.observer_evaluators
+    )
+    collector: AgreementCollector | None = None
+    if profile.base.observer_evaluators:
+        try:
+            if existing_campaign:
+                collector = load_agreement_checkpoint(
+                    profile.base.data_home,
+                    campaign_id,
+                    primary_evaluator_id=profile.base.evaluator.identity,
+                    observers=observer_coordinates,
+                    rubric_version=profile.base.rubric.rubric_version,
+                    dimensions=profile.base.rubric.dimension_names,
+                    profile_snapshot_digest=snapshot_digest,
+                )
+            else:
+                collector = AgreementCollector(
+                    primary_evaluator_id=profile.base.evaluator.identity,
+                    observers=observer_coordinates,
+                    rubric_version=profile.base.rubric.rubric_version,
+                    dimensions=profile.base.rubric.dimension_names,
+                )
+                _persist_agreement_checkpoint(
+                    profile, collector, campaign_id, snapshot_digest
+                )
+        except AgreementCheckpointError:
+            state.update(
+                state="failed",
+                failure_kind="evaluator_agreement_checkpoint",
+            )
+            _atomic_json(path, state)
+            return state
     rejected = list(_rejections(state.get("rejected_candidates", [])))
     seen = {item.candidate_digest for item in rejected}
 
@@ -284,7 +417,15 @@ def run_campaign(
             for entry in train_entries:
                 case = profile.base.cases[entry.case_id]
                 rollout, evaluation = _evaluate_case(
-                    profile, case, profile.base.policy, executor
+                    profile,
+                    case,
+                    profile.base.policy,
+                    executor,
+                    partition=Partition.TRAIN,
+                    collector=collector,
+                )
+                _persist_agreement_checkpoint(
+                    profile, collector, campaign_id, snapshot_digest
                 )
                 if not evaluation.failure_signals:
                     continue
@@ -296,12 +437,21 @@ def run_campaign(
                 _atomic_json(path, state)
                 raise CampaignInterrupted(campaign_id)
             if not patchable:
+                binding = _agreement_binding(
+                    profile,
+                    collector,
+                    campaign_id,
+                    snapshot_digest,
+                    collection_state="complete",
+                )
                 state.update(
                     state="no_patchable_diagnosis",
                     call_count=executor.call_count,
                     rejected_candidate_count=len(rejected),
+                    **binding,
                 )
                 _atomic_json(path, state)
+                cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
                 return state
 
             case, rollout, evaluation, diagnosis = patchable[0]
@@ -325,18 +475,40 @@ def run_campaign(
             )
             candidate = proposed.candidate
             if candidate.digest in seen:
+                binding = _agreement_binding(
+                    profile,
+                    collector,
+                    campaign_id,
+                    snapshot_digest,
+                    collection_state="complete",
+                )
                 state.update(
                     state="no_patchable_diagnosis",
                     call_count=executor.call_count,
                     rejected_candidate_count=len(rejected),
+                    **binding,
                 )
                 _atomic_json(path, state)
+                cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
                 return state
             seen.add(candidate.digest)
 
             def scorer(case_id: str, policy: PolicySnapshot) -> dict[str, float]:
+                partition = next(
+                    entry.partition
+                    for entry in profile.dataset.entries
+                    if entry.case_id == case_id
+                )
                 _, scored = _evaluate_case(
-                    profile, profile.base.cases[case_id], policy, executor
+                    profile,
+                    profile.base.cases[case_id],
+                    policy,
+                    executor,
+                    partition=partition,
+                    collector=collector,
+                )
+                _persist_agreement_checkpoint(
+                    profile, collector, campaign_id, snapshot_digest
                 )
                 return {item.name: item.score for item in scored.dimensions}
 
@@ -348,6 +520,13 @@ def run_campaign(
                 profile.gates,
             )
             if report.passed:
+                binding = _agreement_binding(
+                    profile,
+                    collector,
+                    campaign_id,
+                    snapshot_digest,
+                    collection_state="complete",
+                )
                 destination = resolve_candidate_destination(profile, candidate)
                 monitor.verify()
                 preview = PromotionManager(profile.base.data_home / "promotion").preview(
@@ -370,6 +549,17 @@ def run_campaign(
                     destination=destination,
                     content_preview=preview,
                     manifest_preview=manifest_preview,
+                    evaluator_agreement_path=(
+                        profile.base.data_home
+                        / str(binding["evaluator_agreement_path"])
+                        if binding
+                        else None
+                    ),
+                    evaluator_agreement_digest=(
+                        str(binding["evaluator_agreement_digest"])
+                        if binding
+                        else None
+                    ),
                 )
                 if fault_after_bundle:
                     state.update(
@@ -396,8 +586,10 @@ def run_campaign(
                         profile.base.data_home
                     ).as_posix(),
                     rejected_candidate_count=len(rejected),
+                    **binding,
                 )
                 _atomic_json(path, state)
+                cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
                 return state
 
             rejection = RejectedCandidateSummary(
@@ -415,21 +607,51 @@ def run_campaign(
             state["iteration"] = iteration + 1
             state["call_count"] = executor.call_count
             _atomic_json(path, state)
+            if fault_after_rejection:
+                state["state"] = "failed"
+                _atomic_json(path, state)
+                raise CampaignInterrupted(campaign_id)
 
         state.update(
             state="budget_exhausted",
             call_count=executor.call_count,
             rejected_candidate_count=len(rejected),
+            **_agreement_binding(
+                profile,
+                collector,
+                campaign_id,
+                snapshot_digest,
+                collection_state="budget_exhausted",
+            ),
         )
         _atomic_json(path, state)
+        cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
         return state
     except BudgetExhausted:
+        try:
+            binding = _agreement_binding(
+                profile,
+                collector,
+                campaign_id,
+                snapshot_digest,
+                collection_state="budget_exhausted",
+            )
+        except AgreementPersistenceError:
+            state.update(
+                state="failed",
+                call_count=executor.call_count,
+                failure_kind="evaluator_agreement_persistence",
+            )
+            _atomic_json(path, state)
+            return state
         state.update(
             state="budget_exhausted",
             call_count=executor.call_count,
             rejected_candidate_count=len(rejected),
+            **binding,
         )
         _atomic_json(path, state)
+        cleanup_agreement_checkpoint(profile.base.data_home, campaign_id)
         return state
     except CampaignInterrupted:
         raise
@@ -447,6 +669,22 @@ def run_campaign(
             state="failed",
             call_count=executor.call_count,
             failure_kind=error.kind.value,
+        )
+        _atomic_json(path, state)
+        return state
+    except AgreementPersistenceError:
+        state.update(
+            state="failed",
+            call_count=executor.call_count,
+            failure_kind="evaluator_agreement_persistence",
+        )
+        _atomic_json(path, state)
+        return state
+    except AgreementCheckpointError:
+        state.update(
+            state="failed",
+            call_count=executor.call_count,
+            failure_kind="evaluator_agreement_checkpoint",
         )
         _atomic_json(path, state)
         return state

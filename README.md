@@ -1,8 +1,8 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.5 development milestone. KPO can run finite, budgeted
-> optimization campaigns, persist reviewable promotion transactions, and
-> explicitly apply or recover approved policy updates.
+> Status: v0.6 development milestone. KPO can measure disagreement among
+> independent Evaluators, bind that evidence to reviewable promotion
+> transactions, and explicitly apply or recover approved policy updates.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -94,6 +94,12 @@ operation with an allowlist, diff, snapshot, and journal.
   two-file transaction, and interruption recovery;
 - natural campaign chaining: the next ordinary campaign reloads the applied
   policy as its parent;
+- optional independent observer Evaluators that score the same authorized
+  rollout/reference/rubric payload without influencing the primary gates;
+- deterministic per-dimension agreement, offset, availability, and panel-range
+  metrics, including explicit partial evidence when the global budget ends;
+- strict external agreement reports and promotion bundle v2 approval that
+  binds the exact audit-report bytes;
 - byte-exact source and target integrity checks that avoid hashing the same
   physical file twice within one verification pass.
 
@@ -182,6 +188,11 @@ uv run kpo campaign --profile /path/outside/kpo/profile.toml
 uv run kpo campaign-status \
   --profile /path/outside/kpo/profile.toml \
   --campaign CAMPAIGN_ID
+
+# Inspect aggregate Evaluator agreement evidence without invoking a Provider.
+uv run kpo evaluator-agreement \
+  --profile /path/outside/kpo/profile.toml \
+  --campaign CAMPAIGN_ID
 ```
 
 Dataset expansion follows the same preview/approval rule:
@@ -218,9 +229,11 @@ uv run kpo promote \
 ```
 
 The approval digest binds the candidate, report and policy digests, both
-relative paths, exact original/reviewed bytes, and both displayed diffs. KPO
-never infers this value for a real profile. Recovery restores an interrupted
-prepared transaction; it does not roll back a committed promotion.
+relative paths, exact original/reviewed bytes, and both displayed diffs. When
+observer Evaluators are configured, it also binds the exact aggregate
+agreement-report bytes. KPO never infers this value for a real profile.
+Recovery restores an interrupted prepared transaction; it does not roll back a
+committed promotion.
 
 ## Verify the repository
 
@@ -252,3 +265,4 @@ Approved specifications:
 - [v0.3 optimization campaign](docs/specs/0003-optimization-campaign.md)
 - [v0.4 exact integrity deduplication](docs/specs/0004-exact-integrity-deduplication.md)
 - [v0.5 external promotion and chaining](docs/specs/0005-external-promotion-and-chaining.md)
+- [v0.6 Evaluator agreement audit](docs/specs/0006-evaluator-agreement-audit.md)

@@ -5,9 +5,16 @@ from pathlib import Path
 
 import pytest
 
-from kpo.campaign_profile import load_campaign_profile, resolve_candidate_destination
+from kpo.campaign_profile import (
+    campaign_integrity_monitor,
+    campaign_profile_snapshot,
+    load_campaign_profile,
+    resolve_candidate_destination,
+)
+from kpo.integrity import IntegrityViolation
 from kpo.models import CandidatePatch, MutationKind
 from test_external_cli import _operational_profile
+from test_profile import _append_observer
 
 
 def _campaign_profile(root: Path) -> Path:
@@ -205,3 +212,20 @@ def test_unavailable_hard_sandbox_is_rejected(tmp_path: Path) -> None:
         stream.write('\n[sandbox]\ntype = "container"\n')
     with pytest.raises(ValueError, match="sandbox.*unavailable"):
         load_campaign_profile(path, checkout=Path(__file__).parents[1])
+
+
+def test_observer_executable_is_bound_to_snapshot_and_integrity_monitor(
+    tmp_path: Path,
+) -> None:
+    path = _campaign_profile(tmp_path / "external-observer")
+    _append_observer(path, "observer-a", "observer-model")
+    profile = load_campaign_profile(path, checkout=Path(__file__).parents[1])
+    before = campaign_profile_snapshot(profile)
+    monitor = campaign_integrity_monitor(profile)
+    executable = Path(profile.base.observer_evaluators[0].config.command[0])
+
+    executable.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+
+    assert campaign_profile_snapshot(profile) != before
+    with pytest.raises(IntegrityViolation):
+        monitor.verify()

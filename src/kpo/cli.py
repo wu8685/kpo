@@ -15,6 +15,7 @@ from kpo.external_promotion import (
     preview_campaign_promotion,
     recover_campaign_promotion,
 )
+from kpo.evaluator_agreement import load_agreement_report
 from kpo.hygiene import scan_repository
 from kpo.profile import load_profile
 from kpo.runner import evaluate_profile_run, profile_summary, run_profile, run_status
@@ -81,6 +82,12 @@ def _parser() -> argparse.ArgumentParser:
     campaign_status_parser.add_argument("--profile", type=Path, required=True)
     campaign_status_parser.add_argument("--campaign", required=True)
     campaign_status_parser.add_argument("--checkout", type=Path, default=Path.cwd())
+    agreement = subcommands.add_parser(
+        "evaluator-agreement", help="inspect a campaign evaluator agreement report"
+    )
+    agreement.add_argument("--profile", type=Path, required=True)
+    agreement.add_argument("--campaign", required=True)
+    agreement.add_argument("--checkout", type=Path, default=Path.cwd())
     promote = subcommands.add_parser(
         "promote", help="preview, apply, or recover a campaign promotion"
     )
@@ -186,6 +193,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = campaign_status(
             args.profile, args.campaign, checkout=args.checkout
         )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.command == "evaluator-agreement":
+        profile = load_campaign_profile(args.profile, checkout=args.checkout)
+        result = load_agreement_report(profile, args.campaign)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
     if args.command == "promote":

@@ -16,6 +16,7 @@ from kpo.models import PolicyArtifact, PolicySnapshot, ReferenceArtifact, TaskCa
 
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_OBSERVER_NAME = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,12 @@ class CommandProviderConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ObserverEvaluatorConfig:
+    name: str
+    config: CommandProviderConfig
+
+
+@dataclass(frozen=True, slots=True)
 class ExternalProfile:
     path: Path
     profile_id: str
@@ -55,6 +62,7 @@ class ExternalProfile:
     rubric: Rubric
     actor: CommandProviderConfig
     evaluator: CommandProviderConfig
+    observer_evaluators: tuple[ObserverEvaluatorConfig, ...]
     source_digests: Mapping[str, str]
 
 
@@ -179,6 +187,7 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
             "rubric",
             "actor",
             "evaluator",
+            "observer_evaluators",
             "dataset",
             "proposer",
             "campaign",
@@ -326,6 +335,41 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
         label="evaluator",
         identity_key="evaluator_id",
     )
+    raw_observers = data.get("observer_evaluators", [])
+    if not isinstance(raw_observers, list):
+        raise ValueError("observer_evaluators must be an array")
+    observers: list[ObserverEvaluatorConfig] = []
+    observer_names: set[str] = set()
+    evaluator_identities = {evaluator.identity}
+    for raw_observer in raw_observers:
+        observer_data = _strict(
+            raw_observer,
+            {
+                "name",
+                "adapter",
+                "command",
+                "evaluator_id",
+                "timeout_seconds",
+                "pass_env",
+            },
+            label="observer evaluator",
+        )
+        name = _require_string(observer_data.get("name"), label="observer name")
+        if not _OBSERVER_NAME.fullmatch(name):
+            raise ValueError("observer name must be a safe path component")
+        if name in observer_names:
+            raise ValueError(f"duplicate observer name: {name}")
+        observer_names.add(name)
+        config = _command_config(
+            root,
+            {key: value for key, value in observer_data.items() if key != "name"},
+            label=f"observer evaluator {name}",
+            identity_key="evaluator_id",
+        )
+        if config.identity in evaluator_identities:
+            raise ValueError(f"duplicate evaluator identity: {config.identity}")
+        evaluator_identities.add(config.identity)
+        observers.append(ObserverEvaluatorConfig(name, config))
     data_home_raw = _require_string(data.get("data_home"), label="data_home")
     data_home_path = Path(data_home_raw)
     data_home = (
@@ -347,6 +391,18 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
     evaluator = replace(
         evaluator, working_directory=data_home / "provider-work" / "evaluator"
     )
+    observers = [
+        ObserverEvaluatorConfig(
+            observer.name,
+            replace(
+                observer.config,
+                working_directory=(
+                    data_home / "provider-work" / "evaluators" / observer.name
+                ),
+            ),
+        )
+        for observer in sorted(observers, key=lambda item: item.name)
+    ]
 
     digests = MappingProxyType(
         {str(source.relative_to(root)): _digest_file(source) for source in source_paths}
@@ -366,5 +422,6 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
         ),
         actor=actor,
         evaluator=evaluator,
+        observer_evaluators=tuple(observers),
         source_digests=digests,
     )

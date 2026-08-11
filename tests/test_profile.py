@@ -206,3 +206,79 @@ def test_profile_rejects_duplicate_pass_env(tmp_path: Path) -> None:
     profile_path.write_text(text, encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate"):
         load_profile(profile_path, checkout=Path(__file__).parents[1])
+
+
+def _append_observer(profile_path: Path, name: str, identity: str) -> None:
+    executable = profile_path.parent / "bin" / name
+    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    executable.chmod(0o755)
+    with profile_path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            f'''\n[[observer_evaluators]]
+name = "{name}"
+adapter = "command"
+command = ["./bin/{name}"]
+evaluator_id = "{identity}"
+timeout_seconds = 10
+pass_env = []
+'''
+        )
+
+
+def test_profile_loads_observers_in_semantic_name_order(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path / "observers")
+    _append_observer(profile_path, "observer-z", "evaluator-z")
+    _append_observer(profile_path, "observer-a", "evaluator-a")
+
+    loaded = load_profile(profile_path, checkout=Path(__file__).parents[1])
+
+    assert tuple(item.name for item in loaded.observer_evaluators) == (
+        "observer-a",
+        "observer-z",
+    )
+    assert tuple(item.config.identity for item in loaded.observer_evaluators) == (
+        "evaluator-a",
+        "evaluator-z",
+    )
+    assert loaded.observer_evaluators[0].config.working_directory == (
+        loaded.data_home / "provider-work" / "evaluators" / "observer-a"
+    )
+
+
+@pytest.mark.parametrize(
+    ("second_name", "second_identity", "match"),
+    [
+        ("observer-a", "evaluator-b", "duplicate.*name"),
+        ("observer-b", "evaluator-a", "duplicate.*identity"),
+        ("observer-b", "evaluator-model", "duplicate.*identity"),
+    ],
+)
+def test_profile_rejects_duplicate_observer_coordinates(
+    tmp_path: Path, second_name: str, second_identity: str, match: str
+) -> None:
+    profile_path = _write_profile(tmp_path / "duplicate-observers")
+    _append_observer(profile_path, "observer-a", "evaluator-a")
+    _append_observer(profile_path, second_name, second_identity)
+
+    with pytest.raises(ValueError, match=match):
+        load_profile(profile_path, checkout=Path(__file__).parents[1])
+
+
+def test_profile_rejects_unsafe_or_unknown_observer_fields(tmp_path: Path) -> None:
+    unsafe = _write_profile(tmp_path / "unsafe-observer")
+    _append_observer(unsafe, "observer.a", "evaluator-a")
+    unsafe.write_text(
+        unsafe.read_text(encoding="utf-8").replace(
+            'name = "observer.a"', 'name = "../observer"'
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="name"):
+        load_profile(unsafe, checkout=Path(__file__).parents[1])
+
+    unknown = _write_profile(tmp_path / "unknown-observer")
+    _append_observer(unknown, "observer-a", "evaluator-a")
+    with unknown.open("a", encoding="utf-8") as stream:
+        stream.write('unexpected = true\n')
+    with pytest.raises(ValueError, match="unknown observer"):
+        load_profile(unknown, checkout=Path(__file__).parents[1])

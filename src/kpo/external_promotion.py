@@ -138,7 +138,7 @@ def propose_manifest_update(
     )
 
 
-_BUNDLE_FIELDS = {
+_BUNDLE_FIELDS_V1 = {
     "schema_version",
     "protocol",
     "campaign_id",
@@ -160,6 +160,7 @@ _BUNDLE_FIELDS = {
     "target_digest",
     "files",
 }
+_BUNDLE_FIELDS_V2 = _BUNDLE_FIELDS_V1 | {"evaluator_agreement_digest"}
 _CANDIDATE_FIELDS = {
     "parent_policy_digest",
     "diagnosis_digest",
@@ -175,12 +176,13 @@ _CHANGE_FIELDS = {
     "diff",
     "diff_digest",
 }
-_FILE_FIELDS = {
+_FILE_FIELDS_V1 = {
     "original_content",
     "reviewed_content",
     "original_manifest",
     "reviewed_manifest",
 }
+_FILE_FIELDS_V2 = _FILE_FIELDS_V1 | {"evaluator_agreement"}
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -201,6 +203,8 @@ def persist_promotion_bundle(
     destination: PromotionDestination,
     content_preview: PromotionPreview,
     manifest_preview: ManifestPreview,
+    evaluator_agreement_path: Path | None = None,
+    evaluator_agreement_digest: str | None = None,
 ) -> Path:
     validate_campaign_id(campaign_id)
     if report.candidate_digest != candidate.digest or not report.passed:
@@ -234,9 +238,28 @@ def persist_promotion_bundle(
         "original_manifest": _digest(manifest_preview.original),
         "reviewed_manifest": _digest(manifest_preview.reviewed),
     }
+    agreement_bytes: bytes | None = None
+    if profile.base.observer_evaluators:
+        if evaluator_agreement_path is None or evaluator_agreement_digest is None:
+            raise ValueError("observer campaign requires an agreement report")
+        expected_agreement_path = (
+            profile.base.data_home
+            / "campaigns"
+            / campaign_id
+            / "evaluator-agreement.json"
+        ).resolve()
+        if evaluator_agreement_path.resolve() != expected_agreement_path:
+            raise ValueError("agreement report path does not match campaign")
+        agreement_bytes = evaluator_agreement_path.read_bytes()
+        if _digest(agreement_bytes) != evaluator_agreement_digest:
+            raise ValueError("agreement report byte digest mismatch")
+        files["evaluator_agreement"] = evaluator_agreement_digest
+    elif evaluator_agreement_path is not None or evaluator_agreement_digest is not None:
+        raise ValueError("agreement report requires configured observers")
+    bundle_version = 2 if agreement_bytes is not None else 1
     bundle: dict[str, Any] = {
-        "schema_version": 1,
-        "protocol": "kpo.external-promotion.v1",
+        "schema_version": bundle_version,
+        "protocol": f"kpo.external-promotion.v{bundle_version}",
         "campaign_id": campaign_id,
         "profile_id": profile.base.profile_id,
         "profile_snapshot_digest": profile_snapshot_digest,
@@ -274,6 +297,8 @@ def persist_promotion_bundle(
         "target_digest": target_digest,
         "files": files,
     }
+    if evaluator_agreement_digest is not None:
+        bundle["evaluator_agreement_digest"] = evaluator_agreement_digest
 
     previews = profile.base.data_home / "promotions" / "previews"
     previews.mkdir(parents=True, exist_ok=True)
@@ -287,6 +312,8 @@ def persist_promotion_bundle(
         _atomic_write(temporary / "reviewed-content.bin", reviewed_content)
         _atomic_write(temporary / "original-manifest.jsonl", manifest_preview.original)
         _atomic_write(temporary / "reviewed-manifest.jsonl", manifest_preview.reviewed)
+        if agreement_bytes is not None:
+            _atomic_write(temporary / "evaluator-agreement.json", agreement_bytes)
         _write_json(temporary / "bundle.json", bundle)
         os.replace(temporary, final)
     except BaseException:
@@ -319,15 +346,27 @@ def load_promotion_bundle(
         raw = json.loads(bundle_path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid promotion bundle JSON") from error
-    bundle = _strict_keys(raw, _BUNDLE_FIELDS, label="bundle")
+    if not isinstance(raw, dict):
+        raise ValueError("bundle must be an object")
+    version = raw.get("schema_version")
+    protocol = raw.get("protocol")
+    if version == 1 and protocol == "kpo.external-promotion.v1":
+        bundle_fields = _BUNDLE_FIELDS_V1
+        file_fields = _FILE_FIELDS_V1
+    elif version == 2 and protocol == "kpo.external-promotion.v2":
+        bundle_fields = _BUNDLE_FIELDS_V2
+        file_fields = _FILE_FIELDS_V2
+    else:
+        raise ValueError("unsupported promotion bundle protocol")
+    bundle = _strict_keys(raw, bundle_fields, label="bundle")
     candidate = _strict_keys(bundle["candidate"], _CANDIDATE_FIELDS, label="candidate")
     content = _strict_keys(bundle["content"], _CHANGE_FIELDS, label="content")
     manifest = _strict_keys(bundle["manifest"], _CHANGE_FIELDS, label="manifest")
-    files = _strict_keys(bundle["files"], _FILE_FIELDS, label="files")
-    if bundle["schema_version"] != 1 or bundle["protocol"] != "kpo.external-promotion.v1":
-        raise ValueError("unsupported promotion bundle protocol")
+    files = _strict_keys(bundle["files"], file_fields, label="files")
     if bundle["campaign_id"] != campaign_id or bundle["profile_id"] != profile.base.profile_id:
         raise ValueError("promotion bundle identity mismatch")
+    if (version == 2) != bool(profile.base.observer_evaluators):
+        raise ValueError("promotion bundle observer protocol mismatch")
     if (
         candidate["digest"] != bundle["candidate_digest"]
         or candidate["parent_policy_digest"] != bundle["parent_policy_digest"]
@@ -363,6 +402,8 @@ def load_promotion_bundle(
     }
     if files["original_content"] is not None:
         expected_files.add("original-content.bin")
+    if version == 2:
+        expected_files.add("evaluator-agreement.json")
     actual_files = {path.name for path in directory.iterdir() if path.is_file()}
     if actual_files != expected_files:
         raise ValueError("promotion bundle file set is invalid")
@@ -377,6 +418,37 @@ def load_promotion_bundle(
         (directory / "original-content.bin").read_bytes()
     ) != files["original_content"]:
         raise ValueError("promotion bundle original-content.bin digest mismatch")
+    if version == 2:
+        agreement_path = directory / "evaluator-agreement.json"
+        agreement_digest = _digest(agreement_path.read_bytes())
+        if (
+            agreement_digest != files["evaluator_agreement"]
+            or agreement_digest != bundle["evaluator_agreement_digest"]
+        ):
+            raise ValueError("promotion bundle evaluator-agreement.json digest mismatch")
+        try:
+            from kpo.evaluator_agreement import _validate_report_schema
+
+            agreement_report = _validate_report_schema(
+                json.loads(agreement_path.read_text(encoding="utf-8"))
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError("invalid promotion bundle evaluator-agreement.json") from error
+        expected_observers = [
+            {"name": observer.name, "evaluator_id": observer.config.identity}
+            for observer in profile.base.observer_evaluators
+        ]
+        if (
+            agreement_report["campaign_id"] != bundle["campaign_id"]
+            or agreement_report["profile_id"] != bundle["profile_id"]
+            or agreement_report["profile_snapshot_digest"]
+            != bundle["profile_snapshot_digest"]
+            or agreement_report["primary_evaluator_id"]
+            != profile.base.evaluator.identity
+            or agreement_report["observers"] != expected_observers
+            or agreement_report["collection_state"] != "complete"
+        ):
+            raise ValueError("promotion bundle agreement report identity mismatch")
     if content["original_digest"] != files["original_content"]:
         raise ValueError("promotion bundle original content digest mismatch")
     if content["reviewed_digest"] != files["reviewed_content"]:
@@ -449,8 +521,19 @@ def _validate_campaign_binding(
         "manifest_diff_digest": bundle["manifest"]["diff_digest"],
         "target_digest": bundle["target_digest"],
     }
+    if bundle["schema_version"] == 2:
+        expected.update(
+            evaluator_agreement_path=(
+                Path("campaigns") / bundle["campaign_id"] / "evaluator-agreement.json"
+            ).as_posix(),
+            evaluator_agreement_digest=bundle["evaluator_agreement_digest"],
+        )
     if any(state.get(field) != value for field, value in expected.items()):
         raise ValueError("campaign state does not match promotion bundle")
+    if bundle["schema_version"] == 2:
+        from kpo.evaluator_agreement import load_agreement_report
+
+        load_agreement_report(profile, bundle["campaign_id"])
 
 
 def resume_campaign_promotion_preview(
@@ -468,6 +551,34 @@ def resume_campaign_promotion_preview(
         or state.get("parent_policy_digest") != bundle["parent_policy_digest"]
     ):
         raise ValueError("campaign state does not match installed promotion bundle")
+    agreement_binding: dict[str, Any] = {}
+    if bundle["schema_version"] == 2:
+        from kpo.evaluator_agreement import _validate_report_schema, agreement_summary
+
+        campaign_report = (
+            profile.base.data_home
+            / "campaigns"
+            / campaign_id
+            / "evaluator-agreement.json"
+        )
+        bundle_report = loaded.directory / "evaluator-agreement.json"
+        if (
+            not campaign_report.is_file()
+            or campaign_report.read_bytes() != bundle_report.read_bytes()
+            or _digest(campaign_report.read_bytes())
+            != bundle["evaluator_agreement_digest"]
+        ):
+            raise ValueError("installed agreement report does not match bundle")
+        report = _validate_report_schema(
+            json.loads(campaign_report.read_text(encoding="utf-8"))
+        )
+        agreement_binding = {
+            "evaluator_agreement_path": campaign_report.relative_to(
+                profile.base.data_home
+            ).as_posix(),
+            "evaluator_agreement_digest": bundle["evaluator_agreement_digest"],
+            "evaluator_agreement_summary": agreement_summary(report),
+        }
     _validate_original_transaction(profile, loaded)
     budget_path = (
         profile.base.data_home / "campaigns" / campaign_id / "call-budget.json"
@@ -500,6 +611,7 @@ def resume_campaign_promotion_preview(
             profile.base.data_home
         ).as_posix(),
         "rejected_candidate_count": len(state.get("rejected_candidates", [])),
+        **agreement_binding,
     }
 
 
@@ -608,7 +720,7 @@ def preview_campaign_promotion(
     _validate_campaign_binding(profile, state, loaded)
     _validate_original_transaction(profile, loaded)
     bundle = loaded.bundle
-    return {
+    result = {
         "state": "preview",
         "campaign_id": campaign_id,
         "candidate_digest": bundle["candidate_digest"],
@@ -619,6 +731,12 @@ def preview_campaign_promotion(
         "content_diff": bundle["content"]["diff"],
         "manifest_diff": bundle["manifest"]["diff"],
     }
+    if bundle["schema_version"] == 2:
+        result.update(
+            evaluator_agreement_digest=bundle["evaluator_agreement_digest"],
+            evaluator_agreement_summary=state["evaluator_agreement_summary"],
+        )
+    return result
 
 
 def _lock_path(profile: CampaignProfile) -> Path:

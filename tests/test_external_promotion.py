@@ -173,6 +173,192 @@ def _prepared_campaign(tmp_path: Path, *, edit: bool = False) -> tuple[Path, dic
     return profile_path, result
 
 
+def _prepared_observer_campaign(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object]]:
+    from kpo.campaign import initialize_campaign_dataset, run_campaign
+    from test_campaign import _add_observers, _working_profile
+
+    profile_path = _working_profile(tmp_path / "external")
+    _add_observers(profile_path)
+    init = initialize_campaign_dataset(
+        profile_path, checkout=Path(__file__).parents[1]
+    )
+    initialize_campaign_dataset(
+        profile_path,
+        checkout=Path(__file__).parents[1],
+        approval_digest=init["approval_digest"],
+    )
+    result = run_campaign(
+        profile_path,
+        checkout=Path(__file__).parents[1],
+        campaign_id="observer-promotion",
+    )
+    return profile_path, result
+
+
+def test_observer_campaign_uses_strict_v2_bundle_bound_to_agreement_bytes(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+
+    profile_path, campaign = _prepared_observer_campaign(tmp_path)
+    checkout = Path(__file__).parents[1]
+    profile = load_campaign_profile(profile_path, checkout=checkout)
+    loaded = load_promotion_bundle(profile, str(campaign["campaign_id"]))
+    bundle = loaded.bundle
+    bundle_report = loaded.directory / "evaluator-agreement.json"
+    campaign_report = (
+        profile.base.data_home / str(campaign["evaluator_agreement_path"])
+    )
+    report_digest = hashlib.sha256(bundle_report.read_bytes()).hexdigest()
+
+    assert bundle["schema_version"] == 2
+    assert bundle["protocol"] == "kpo.external-promotion.v2"
+    assert bundle["evaluator_agreement_digest"] == report_digest
+    assert bundle["files"]["evaluator_agreement"] == report_digest
+    assert bundle_report.read_bytes() == campaign_report.read_bytes()
+    assert report_digest == campaign["evaluator_agreement_digest"]
+
+    bundle_path = loaded.directory / "bundle.json"
+    original_bundle = bundle_path.read_bytes()
+    missing = json.loads(original_bundle)
+    missing.pop("evaluator_agreement_digest")
+    bundle_path.write_text(json.dumps(missing), encoding="utf-8")
+    with pytest.raises(ValueError, match="missing bundle fields"):
+        load_promotion_bundle(profile, str(campaign["campaign_id"]))
+    bundle_path.write_bytes(original_bundle)
+
+    original = bundle_report.read_bytes()
+    bundle_report.write_bytes(original + b" ")
+    with pytest.raises(ValueError, match="evaluator-agreement"):
+        load_promotion_bundle(profile, str(campaign["campaign_id"]))
+
+
+def test_v2_promote_preview_displays_bound_agreement_summary(
+    tmp_path: Path,
+) -> None:
+    from kpo.external_promotion import preview_campaign_promotion
+
+    profile_path, campaign = _prepared_observer_campaign(tmp_path)
+
+    preview = preview_campaign_promotion(
+        profile_path,
+        str(campaign["campaign_id"]),
+        checkout=Path(__file__).parents[1],
+    )
+
+    assert preview["evaluator_agreement_digest"] == campaign[
+        "evaluator_agreement_digest"
+    ]
+    assert preview["evaluator_agreement_summary"] == campaign[
+        "evaluator_agreement_summary"
+    ]
+
+
+def test_v2_apply_and_interrupted_recovery_preserve_agreement_evidence(
+    tmp_path: Path,
+) -> None:
+    profile_path, campaign = _prepared_observer_campaign(tmp_path)
+    checkout = Path(__file__).parents[1]
+    profile = load_campaign_profile(profile_path, checkout=checkout)
+    loaded = load_promotion_bundle(profile, str(campaign["campaign_id"]))
+    agreement_before = (loaded.directory / "evaluator-agreement.json").read_bytes()
+
+    with pytest.raises(ExternalPromotionInterrupted):
+        apply_campaign_promotion(
+            profile_path,
+            str(campaign["campaign_id"]),
+            checkout=checkout,
+            approval_digest=loaded.approval_digest,
+            fault_after_content=True,
+        )
+    recovered = recover_campaign_promotion(
+        profile_path, str(campaign["campaign_id"]), checkout=checkout
+    )
+
+    assert recovered["state"] == "recovered"
+    assert not (profile_path.parent / "policies" / "improved-rule.md").exists()
+    assert (loaded.directory / "evaluator-agreement.json").read_bytes() == agreement_before
+
+
+def test_v2_installed_bundle_resume_restores_agreement_binding_without_calls(
+    tmp_path: Path,
+) -> None:
+    from kpo.campaign import (
+        CampaignInterrupted,
+        campaign_status,
+        initialize_campaign_dataset,
+        run_campaign,
+    )
+    from test_campaign import _add_observers, _working_profile
+
+    profile_path = _working_profile(tmp_path / "external")
+    _add_observers(profile_path)
+    init = initialize_campaign_dataset(
+        profile_path, checkout=Path(__file__).parents[1]
+    )
+    initialize_campaign_dataset(
+        profile_path,
+        checkout=Path(__file__).parents[1],
+        approval_digest=init["approval_digest"],
+    )
+    with pytest.raises(CampaignInterrupted) as interrupted:
+        run_campaign(
+            profile_path,
+            checkout=Path(__file__).parents[1],
+            campaign_id="v2-resume",
+            fault_after_bundle=True,
+        )
+    campaign_id = interrupted.value.campaign_id
+    data_home = profile_path.parent / "runtime"
+    budget = data_home / "campaigns" / campaign_id / "call-budget.json"
+    budget_before = budget.read_bytes()
+    failed = campaign_status(profile_path, campaign_id, checkout=Path(__file__).parents[1])
+    assert "evaluator_agreement_digest" not in failed
+
+    resumed = run_campaign(
+        profile_path,
+        checkout=Path(__file__).parents[1],
+        campaign_id=campaign_id,
+        resume=True,
+    )
+
+    assert resumed["state"] == "promotion_previewed"
+    assert resumed["evaluator_agreement_digest"]
+    assert resumed["evaluator_agreement_summary"]["observer_count"] == 2
+    assert budget.read_bytes() == budget_before
+
+
+def test_v2_committed_recovery_keeps_historical_agreement_inspectable(
+    tmp_path: Path,
+) -> None:
+    from kpo.evaluator_agreement import load_agreement_report
+
+    profile_path, campaign = _prepared_observer_campaign(tmp_path)
+    checkout = Path(__file__).parents[1]
+    profile = load_campaign_profile(profile_path, checkout=checkout)
+    loaded = load_promotion_bundle(profile, str(campaign["campaign_id"]))
+
+    with pytest.raises(ExternalPromotionInterrupted):
+        apply_campaign_promotion(
+            profile_path,
+            str(campaign["campaign_id"]),
+            checkout=checkout,
+            approval_digest=loaded.approval_digest,
+            fault_after_commit=True,
+        )
+    result = recover_campaign_promotion(
+        profile_path, str(campaign["campaign_id"]), checkout=checkout
+    )
+    applied_profile = load_campaign_profile(profile_path, checkout=checkout)
+
+    assert result["state"] == "applied"
+    assert load_agreement_report(
+        applied_profile, str(campaign["campaign_id"])
+    )["report_digest"]
+
+
 def test_promote_cli_preview_is_deterministic_and_non_mutating(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

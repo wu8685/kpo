@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kpo"
+version = "0.1.0.dev0"
+description = "Knowledge Policy Optimization"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "wuke", email = "optimuswu8685@gmail.com" },
+]
+dependencies = []
+
+[project.scripts]
+kpo = "kpo.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kpo"]

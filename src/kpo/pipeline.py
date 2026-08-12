@@ -19,6 +19,7 @@ from kpo.models import (
     ScoreDimension,
     TaskCase,
 )
+from kpo.reasoning_differential import DifferentialDiagnosis
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +46,7 @@ class ProposerRequest:
     references: tuple[ReferenceArtifact, ...]
     rejected_candidates: tuple[RejectedCandidateSummary, ...] = ()
     allowed_mutations: tuple[str, ...] = ("add", "edit")
+    differential_diagnosis: DifferentialDiagnosis | None = None
 
 
 class ActorProvider(Protocol):
@@ -125,6 +127,7 @@ def run_proposer(
     provider: ProposerProvider,
     *,
     rejected_candidates: tuple[RejectedCandidateSummary, ...] = (),
+    differential_diagnosis: DifferentialDiagnosis | None = None,
 ) -> ProposedCandidate:
     if not diagnosis.patchable:
         raise ValueError(f"diagnosis {diagnosis.kind.value} does not permit proposer")
@@ -142,14 +145,20 @@ def run_proposer(
     provided_reference_ids = {reference.artifact_id for reference in references}
     if not references or provided_reference_ids != expected_reference_ids:
         raise ValueError("proposer references must be cited by the diagnosis")
+    if (
+        differential_diagnosis is not None
+        and differential_diagnosis.evaluation_digest != evaluation.digest
+    ):
+        raise ValueError("differential diagnosis does not match evaluation")
     draft = provider.propose(
         ProposerRequest(
-            diagnosis,
-            parent,
-            rollout,
-            evaluation,
-            references,
-            rejected_candidates,
+            diagnosis=diagnosis,
+            parent_policy=parent,
+            rollout=rollout,
+            evaluation=evaluation,
+            references=references,
+            rejected_candidates=rejected_candidates,
+            differential_diagnosis=differential_diagnosis,
         )
     )
     candidate = propose_patch(

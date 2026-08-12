@@ -73,6 +73,13 @@ from kpo.provider import (
     CommandProposerProvider,
     ProviderFailure,
 )
+from kpo.reasoning_differential import (
+    DifferentialDiagnosis,
+    load_differential_summary,
+    persist_differential_iteration,
+    persist_differential_summary,
+    run_reasoning_differential,
+)
 from kpo.vector_regression import VectorRegressionReport, run_vector_regression
 
 
@@ -280,6 +287,18 @@ def _persist_series_terminal(
     *,
     report: VectorRegressionReport | None,
 ) -> dict[str, Any]:
+    if profile.differential_analyzer is not None:
+        analyzer = profile.differential_analyzer
+        state.update(
+            **persist_differential_summary(
+                profile.base.data_home,
+                state["campaign_id"],
+                profile_snapshot_digest=state["profile_snapshot_digest"],
+                extractor=analyzer.extractor,
+                differ=analyzer.differ,
+                diagnostician=analyzer.diagnostician,
+            )
+        )
     series_id = state.get("series_id")
     if series_id is None:
         _atomic_json(path, state)
@@ -717,6 +736,54 @@ def run_campaign(
                 return state
 
             case, rollout, evaluation, diagnosis = patchable[0]
+            differential_diagnosis: DifferentialDiagnosis | None = None
+            if profile.differential_analyzer is not None:
+                references = _references(profile, case)
+                analyzer = profile.differential_analyzer
+                differential_context = _call_context(
+                    profile,
+                    case,
+                    profile.base.policy,
+                    references,
+                    role="evaluator",
+                )
+                try:
+                    differential_analysis = run_reasoning_differential(
+                        partition=Partition.TRAIN,
+                        rollout=rollout,
+                        references=references,
+                        evaluation=evaluation,
+                        extractor=analyzer.extractor,
+                        differ=analyzer.differ,
+                        diagnostician=analyzer.diagnostician,
+                        executor=executor,
+                        context=differential_context,
+                    )
+                except BudgetExhausted:
+                    persist_differential_iteration(
+                        profile.base.data_home,
+                        campaign_id,
+                        iteration,
+                        analysis=None,
+                        failure_kind="budget_exhausted",
+                    )
+                    raise
+                except ProviderFailure as error:
+                    persist_differential_iteration(
+                        profile.base.data_home,
+                        campaign_id,
+                        iteration,
+                        analysis=None,
+                        failure_kind=error.kind.value,
+                    )
+                else:
+                    persist_differential_iteration(
+                        profile.base.data_home,
+                        campaign_id,
+                        iteration,
+                        analysis=differential_analysis,
+                    )
+                    differential_diagnosis = differential_analysis.diagnosis
             proposal_context = _call_context(
                 profile,
                 case,
@@ -734,6 +801,7 @@ def run_campaign(
                     profile.proposer, executor=executor, context=proposal_context
                 ),
                 rejected_candidates=tuple(rejected),
+                differential_diagnosis=differential_diagnosis,
             )
             candidate = proposed.candidate
             if candidate.digest in seen:
@@ -792,6 +860,17 @@ def run_campaign(
                     snapshot_digest,
                     collection_state="complete",
                 )
+                differential_binding: dict[str, Any] = {}
+                if profile.differential_analyzer is not None:
+                    analyzer = profile.differential_analyzer
+                    differential_binding = persist_differential_summary(
+                        profile.base.data_home,
+                        campaign_id,
+                        profile_snapshot_digest=snapshot_digest,
+                        extractor=analyzer.extractor,
+                        differ=analyzer.differ,
+                        diagnostician=analyzer.diagnostician,
+                    )
                 destination = resolve_candidate_destination(profile, candidate)
                 monitor.verify()
                 preview = PromotionManager(profile.base.data_home / "promotion").preview(
@@ -825,6 +904,17 @@ def run_campaign(
                         if binding
                         else None
                     ),
+                    differential_analysis_path=(
+                        profile.base.data_home
+                        / str(differential_binding["differential_analysis_path"])
+                        if differential_binding
+                        else None
+                    ),
+                    differential_analysis_digest=(
+                        str(differential_binding["differential_analysis_digest"])
+                        if differential_binding
+                        else None
+                    ),
                 )
                 if fault_after_bundle:
                     state.update(
@@ -852,6 +942,7 @@ def run_campaign(
                     ).as_posix(),
                     rejected_candidate_count=len(rejected),
                     **binding,
+                    **differential_binding,
                 )
                 state.pop("series_pending_report", None)
                 _persist_series_terminal(profile, state, path, report=report)
@@ -984,4 +1075,14 @@ def campaign_status(
     path = _state_path(profile, campaign_id)
     if not path.exists():
         raise KeyError(f"unknown campaign: {campaign_id}")
-    return json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if profile.differential_analyzer is not None:
+        summary = load_differential_summary(
+            profile.base.data_home,
+            campaign_id,
+            profile_snapshot_digest=state["profile_snapshot_digest"],
+            expected_byte_digest=state.get("differential_analysis_digest"),
+        )
+        if summary != state.get("differential_analysis_summary"):
+            raise ValueError("campaign differential summary binding mismatch")
+    return state

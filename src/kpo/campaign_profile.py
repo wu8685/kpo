@@ -45,6 +45,13 @@ class GeneralizationConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DifferentialAnalyzerConfig:
+    extractor: CommandProviderConfig
+    differ: CommandProviderConfig
+    diagnostician: CommandProviderConfig
+
+
+@dataclass(frozen=True, slots=True)
 class CampaignProfile:
     base: ExternalProfile
     dataset: DatasetManifest
@@ -63,6 +70,7 @@ class CampaignProfile:
     evaluator_audit: EvaluatorAuditConfig | None
     series: SeriesConfig | None
     generalization: GeneralizationConfig | None
+    differential_analyzer: DifferentialAnalyzerConfig | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +86,15 @@ def validate_campaign_id(value: str) -> str:
 
 
 def campaign_profile_snapshot(profile: CampaignProfile) -> str:
-    commands = (profile.base.actor, profile.base.evaluator, profile.proposer)
+    commands = (profile.base.actor, profile.base.evaluator, profile.proposer) + (
+        ()
+        if profile.differential_analyzer is None
+        else (
+            profile.differential_analyzer.extractor,
+            profile.differential_analyzer.differ,
+            profile.differential_analyzer.diagnostician,
+        )
+    )
     snapshot = {
         "profile_sources": profile.base.source_digests,
         "dataset_digest": profile.dataset.digest,
@@ -137,6 +153,15 @@ def campaign_integrity_monitor(profile: CampaignProfile) -> IntegrityMonitor:
             Path(profile.base.evaluator.command[0]),
             Path(profile.proposer.command[0]),
             *(
+                ()
+                if profile.differential_analyzer is None
+                else (
+                    Path(profile.differential_analyzer.extractor.command[0]),
+                    Path(profile.differential_analyzer.differ.command[0]),
+                    Path(profile.differential_analyzer.diagnostician.command[0]),
+                )
+            ),
+            *(
                 Path(observer.config.command[0])
                 for observer in profile.base.observer_evaluators
             ),
@@ -158,6 +183,40 @@ def _positive_integer(value: object, label: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 1:
         raise ValueError(f"{label} must be a positive integer")
     return value
+
+
+def _differential_analyzer_config(
+    raw: object, *, root: Path, base: ExternalProfile
+) -> DifferentialAnalyzerConfig | None:
+    if raw is None:
+        return None
+    section = _strict(
+        raw,
+        {"extractor", "differ", "diagnostician"},
+        label="differential_analyzer",
+    )
+    if set(section) != {"extractor", "differ", "diagnostician"}:
+        raise ValueError(
+            "differential_analyzer must configure all three providers"
+        )
+
+    def command(name: str) -> CommandProviderConfig:
+        loaded = _command_config(
+            root,
+            section[name],
+            label=f"differential_analyzer.{name}",
+            identity_key="model_id",
+        )
+        return replace(
+            loaded,
+            working_directory=base.data_home / "provider-work" / name,
+        )
+
+    return DifferentialAnalyzerConfig(
+        extractor=command("extractor"),
+        differ=command("differ"),
+        diagnostician=command("diagnostician"),
+    )
 
 
 def _unit_float(value: object, label: str) -> float:
@@ -386,6 +445,9 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
     generalization = _generalization_config(
         series_raw, root=root, base=base, dataset=dataset
     )
+    differential_analyzer = _differential_analyzer_config(
+        raw.get("differential_analyzer"), root=root, base=base
+    )
     return CampaignProfile(
         base=base,
         dataset=dataset,
@@ -406,6 +468,7 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         evaluator_audit=evaluator_audit,
         series=series,
         generalization=generalization,
+        differential_analyzer=differential_analyzer,
     )
 
 

@@ -25,6 +25,11 @@ _ROLE_CONTEXT = {
     "evaluator": _COMMON_CONTEXT | {"reference_set_digest", "rubric_digest"},
     "proposer": _COMMON_CONTEXT
     | {"reference_set_digest", "rubric_digest", "rejected_candidates_digest"},
+    "reasoning_extractor": _COMMON_CONTEXT
+    | {"reference_set_digest", "rubric_digest"},
+    "claim_differ": _COMMON_CONTEXT | {"reference_set_digest", "rubric_digest"},
+    "differential_diagnostician": _COMMON_CONTEXT
+    | {"reference_set_digest", "rubric_digest"},
 }
 
 

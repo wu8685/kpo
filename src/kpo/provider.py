@@ -332,10 +332,7 @@ class CommandProposerProvider:
         self.context = context or {}
 
     def propose(self, request: ProposerRequest) -> ProposalDraft:
-        value = _dispatch(
-            self.config,
-            "proposer",
-            {
+        request_value = {
                 "parent_policy": {
                     "digest": request.parent_policy.digest,
                     "artifacts": [
@@ -399,7 +396,15 @@ class CommandProposerProvider:
                     for item in request.rejected_candidates
                 ],
                 "model_id": self.config.identity,
-            },
+            }
+        if request.differential_diagnosis is not None:
+            request_value["differential_diagnosis"] = (
+                request.differential_diagnosis.to_public_value()
+            )
+        value = _dispatch(
+            self.config,
+            "proposer",
+            request_value,
             self.executor,
             self.context,
         )

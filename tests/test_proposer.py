@@ -21,6 +21,14 @@ from kpo.models import (
 from kpo.pipeline import ProposerRequest, run_proposer
 from kpo.profile import CommandProviderConfig
 from kpo.provider import CommandProposerProvider, ProviderFailure
+from kpo.reasoning_differential import (
+    AxisAssessment,
+    DifferentialAxis,
+    DifferentialDiagnosis,
+    DifferentialKind,
+    GapSummary,
+    ClaimType,
+)
 
 
 def _inputs() -> tuple[PolicySnapshot, Rollout, Evaluation, Diagnosis, tuple[ReferenceArtifact, ...]]:
@@ -154,3 +162,88 @@ def test_proposer_requires_every_cited_reference_excerpt() -> None:
         run_proposer(
             incomplete, policy, rollout, evaluation, references, MustNotRun()
         )
+
+
+def _differential_diagnosis(evaluation_digest: str) -> DifferentialDiagnosis:
+    return DifferentialDiagnosis.create(
+        evaluation_digest=evaluation_digest,
+        claim_differential_digest="b" * 64,
+        conclusion_validity=DifferentialAxis(
+            AxisAssessment.CHALLENGED, 0.8, "Evaluation challenges the conclusion."
+        ),
+        reasoning_fidelity=DifferentialAxis(
+            AxisAssessment.SUPPORTED, 0.9, "Structure is similar."
+        ),
+        reasoning_soundness=DifferentialAxis(
+            AxisAssessment.CHALLENGED, 0.7, "A boundary step is absent."
+        ),
+        gaps=(
+            GapSummary(
+                DifferentialKind.MISSING,
+                ClaimType.ANALYTICAL,
+                None,
+                "boundary-check",
+                0.8,
+                "add_boundary_rule",
+            ),
+        ),
+    )
+
+
+def test_legacy_proposer_wire_request_omits_differential_field() -> None:
+    response = {
+        "mutation": "add",
+        "artifact_id": "boundary-rule",
+        "content": "Add the boundary.",
+        "expected_benefit": "Improve reasoning.",
+        "possible_regressions": [],
+    }
+    code = (
+        "import json,sys; r=json.load(sys.stdin); "
+        "assert 'differential_diagnosis' not in r['request']; "
+        f"json.dump({response!r},sys.stdout)"
+    )
+    policy, rollout, evaluation, diagnosis, references = _inputs()
+
+    run_proposer(
+        diagnosis,
+        policy,
+        rollout,
+        evaluation,
+        references,
+        CommandProposerProvider(
+            CommandProviderConfig((sys.executable, "-c", code), "p", 2, ())
+        ),
+    )
+
+
+def test_configured_proposer_receives_only_public_differential_diagnosis() -> None:
+    response = {
+        "mutation": "add",
+        "artifact_id": "boundary-rule",
+        "content": "Add the boundary.",
+        "expected_benefit": "Improve reasoning.",
+        "possible_regressions": [],
+    }
+    code = (
+        "import json,sys; r=json.load(sys.stdin)['request']; "
+        "d=r['differential_diagnosis']; s=json.dumps(d); "
+        "assert d['reference_is_standard'] is False; "
+        "assert d['gaps'][0]['recommendation_category']=='add_boundary_rule'; "
+        "assert 'Train reference excerpt' not in s; "
+        "assert 'baseline' not in s; assert 'claim_id' not in s; "
+        f"json.dump({response!r},sys.stdout)"
+    )
+    policy, rollout, evaluation, diagnosis, references = _inputs()
+
+    run_proposer(
+        diagnosis,
+        policy,
+        rollout,
+        evaluation,
+        references,
+        CommandProposerProvider(
+            CommandProviderConfig((sys.executable, "-c", code), "p", 2, ())
+        ),
+        differential_diagnosis=_differential_diagnosis(evaluation.digest),
+    )

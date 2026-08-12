@@ -122,6 +122,10 @@ _EVIDENCE_FIELDS = {
     "calibration_report_digest",
     "record_digest",
 }
+_EVIDENCE_V2_FIELDS = _EVIDENCE_FIELDS | {
+    "differential_summary_byte_digest",
+    "differential_summary_record_digest",
+}
 _SCORE_FIELDS = {
     "validation_gain",
     "holdout_gain",
@@ -357,6 +361,22 @@ def build_series_contract(profile: CampaignProfile) -> SeriesContract:
                 "generalization": components["generalization"],
             }
         )
+    if profile.differential_analyzer is not None:
+        analyzer = profile.differential_analyzer
+
+        def differential_provider(config: Any) -> dict[str, Any]:
+            component = _provider_component("differential", config)
+            return {
+                "identity": component["identity"],
+                "configuration_digest": component["configuration_digest"],
+                "executable_digest": component["executable_digest"],
+            }
+
+        components["differential_analyzer"] = {
+            "extractor": differential_provider(analyzer.extractor),
+            "differ": differential_provider(analyzer.differ),
+            "diagnostician": differential_provider(analyzer.diagnostician),
+        }
     return SeriesContract(
         components=components,
         digest=canonical_digest(components),
@@ -1219,7 +1239,11 @@ def persist_campaign_series_evidence(
     if not _valid_digest(profile_snapshot_digest):
         raise ValueError("invalid profile snapshot digest")
     fields = {
-        "protocol": "kpo.campaign-series-evidence/v1",
+        "protocol": (
+            "kpo.campaign-series-evidence/v2"
+            if profile.differential_analyzer is not None
+            else "kpo.campaign-series-evidence/v1"
+        ),
         "campaign_id": campaign_id,
         "series_id": series_id,
         "series_index": series_index,
@@ -1254,6 +1278,19 @@ def persist_campaign_series_evidence(
             report_bindings, "evaluator_calibration_report_digest"
         ),
     }
+    if profile.differential_analyzer is not None:
+        fields.update(
+            differential_summary_byte_digest=_optional_binding(
+                report_bindings, "differential_analysis_digest"
+            ),
+            differential_summary_record_digest=_optional_binding(
+                report_bindings, "differential_analysis_summary_record_digest"
+            )
+            or _optional_binding(
+                report_bindings.get("differential_analysis_summary", {}),
+                "record_digest",
+            ),
+        )
     record = fields | {"record_digest": canonical_digest(fields)}
     path = _evidence_path(profile, campaign_id, revision)
     if path.exists():
@@ -1304,13 +1341,23 @@ def load_campaign_series_evidence(
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("invalid campaign series evidence JSON") from error
-    record = _strict(raw, _EVIDENCE_FIELDS, "campaign series evidence")
+    expected_protocol = (
+        "kpo.campaign-series-evidence/v2"
+        if profile.differential_analyzer is not None
+        else "kpo.campaign-series-evidence/v1"
+    )
+    expected_fields = (
+        _EVIDENCE_V2_FIELDS
+        if profile.differential_analyzer is not None
+        else _EVIDENCE_FIELDS
+    )
+    record = _strict(raw, expected_fields, "campaign series evidence")
     digest = record["record_digest"]
     fields = {key: value for key, value in record.items() if key != "record_digest"}
     if not _valid_digest(digest) or digest != canonical_digest(fields):
         raise ValueError("campaign series evidence record digest mismatch")
     if (
-        record["protocol"] != "kpo.campaign-series-evidence/v1"
+        record["protocol"] != expected_protocol
         or record["campaign_id"] != campaign_id
         or record["revision"] != revision
         or record["profile_id"] != profile.base.profile_id
@@ -1360,6 +1407,14 @@ def load_campaign_series_evidence(
         "calibration_byte_digest",
         "calibration_observations_byte_digest",
         "calibration_report_digest",
+        *(
+            (
+                "differential_summary_byte_digest",
+                "differential_summary_record_digest",
+            )
+            if profile.differential_analyzer is not None
+            else ()
+        ),
     ):
         if record[key] is not None and not _valid_digest(record[key]):
             raise ValueError(f"invalid campaign series evidence {key}")

@@ -88,3 +88,29 @@ def test_provider_call_budget_is_hard_limit(tmp_path: Path) -> None:
 
     state = json.loads(executor.state_path.read_text(encoding="utf-8"))
     assert state["call_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["reasoning_extractor", "claim_differ", "differential_diagnostician"],
+)
+def test_differential_provider_roles_share_campaign_budget_and_cache(
+    tmp_path: Path, role: str
+) -> None:
+    counter = tmp_path / "counter"
+    executor = CampaignCallExecutor(tmp_path / "runtime", "campaign-1", max_calls=1)
+    context = _context(1) | {
+        "reference_set_digest": "refs",
+        "rubric_digest": "rubric",
+    }
+
+    first = executor.invoke(
+        _counting_config(counter), role, {"value": "result"}, context=context
+    )
+    second = executor.invoke(
+        _counting_config(counter), role, {"value": "result"}, context=context
+    )
+
+    assert first == second
+    assert counter.read_text() == "1"
+    assert executor.call_count == 1

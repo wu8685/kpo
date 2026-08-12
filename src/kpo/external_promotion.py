@@ -161,6 +161,8 @@ _BUNDLE_FIELDS_V1 = {
     "files",
 }
 _BUNDLE_FIELDS_V2 = _BUNDLE_FIELDS_V1 | {"evaluator_agreement_digest"}
+_BUNDLE_FIELDS_V3 = _BUNDLE_FIELDS_V1 | {"differential_analysis_digest"}
+_BUNDLE_FIELDS_V4 = _BUNDLE_FIELDS_V2 | {"differential_analysis_digest"}
 _CANDIDATE_FIELDS = {
     "parent_policy_digest",
     "diagnosis_digest",
@@ -183,6 +185,8 @@ _FILE_FIELDS_V1 = {
     "reviewed_manifest",
 }
 _FILE_FIELDS_V2 = _FILE_FIELDS_V1 | {"evaluator_agreement"}
+_FILE_FIELDS_V3 = _FILE_FIELDS_V1 | {"differential_analysis"}
+_FILE_FIELDS_V4 = _FILE_FIELDS_V2 | {"differential_analysis"}
 
 
 def _write_json(path: Path, value: dict[str, Any]) -> None:
@@ -205,6 +209,8 @@ def persist_promotion_bundle(
     manifest_preview: ManifestPreview,
     evaluator_agreement_path: Path | None = None,
     evaluator_agreement_digest: str | None = None,
+    differential_analysis_path: Path | None = None,
+    differential_analysis_digest: str | None = None,
 ) -> Path:
     validate_campaign_id(campaign_id)
     if report.candidate_digest != candidate.digest or not report.passed:
@@ -256,7 +262,30 @@ def persist_promotion_bundle(
         files["evaluator_agreement"] = evaluator_agreement_digest
     elif evaluator_agreement_path is not None or evaluator_agreement_digest is not None:
         raise ValueError("agreement report requires configured observers")
-    bundle_version = 2 if agreement_bytes is not None else 1
+    differential_bytes: bytes | None = None
+    if profile.differential_analyzer is not None:
+        if differential_analysis_path is None or differential_analysis_digest is None:
+            raise ValueError("configured differential analysis requires a summary")
+        expected_differential_path = (
+            profile.base.data_home
+            / "campaigns"
+            / campaign_id
+            / "differential-analysis-summary.json"
+        ).resolve()
+        if differential_analysis_path.resolve() != expected_differential_path:
+            raise ValueError("differential summary path does not match campaign")
+        differential_bytes = differential_analysis_path.read_bytes()
+        if _digest(differential_bytes) != differential_analysis_digest:
+            raise ValueError("differential summary byte digest mismatch")
+        files["differential_analysis"] = differential_analysis_digest
+    elif differential_analysis_path is not None or differential_analysis_digest is not None:
+        raise ValueError("differential summary requires a configured analyzer")
+    bundle_version = {
+        (False, False): 1,
+        (True, False): 2,
+        (False, True): 3,
+        (True, True): 4,
+    }[(agreement_bytes is not None, differential_bytes is not None)]
     bundle: dict[str, Any] = {
         "schema_version": bundle_version,
         "protocol": f"kpo.external-promotion.v{bundle_version}",
@@ -299,6 +328,8 @@ def persist_promotion_bundle(
     }
     if evaluator_agreement_digest is not None:
         bundle["evaluator_agreement_digest"] = evaluator_agreement_digest
+    if differential_analysis_digest is not None:
+        bundle["differential_analysis_digest"] = differential_analysis_digest
 
     previews = profile.base.data_home / "promotions" / "previews"
     previews.mkdir(parents=True, exist_ok=True)
@@ -314,6 +345,11 @@ def persist_promotion_bundle(
         _atomic_write(temporary / "reviewed-manifest.jsonl", manifest_preview.reviewed)
         if agreement_bytes is not None:
             _atomic_write(temporary / "evaluator-agreement.json", agreement_bytes)
+        if differential_bytes is not None:
+            _atomic_write(
+                temporary / "differential-analysis-summary.json",
+                differential_bytes,
+            )
         _write_json(temporary / "bundle.json", bundle)
         os.replace(temporary, final)
     except BaseException:
@@ -356,6 +392,12 @@ def load_promotion_bundle(
     elif version == 2 and protocol == "kpo.external-promotion.v2":
         bundle_fields = _BUNDLE_FIELDS_V2
         file_fields = _FILE_FIELDS_V2
+    elif version == 3 and protocol == "kpo.external-promotion.v3":
+        bundle_fields = _BUNDLE_FIELDS_V3
+        file_fields = _FILE_FIELDS_V3
+    elif version == 4 and protocol == "kpo.external-promotion.v4":
+        bundle_fields = _BUNDLE_FIELDS_V4
+        file_fields = _FILE_FIELDS_V4
     else:
         raise ValueError("unsupported promotion bundle protocol")
     bundle = _strict_keys(raw, bundle_fields, label="bundle")
@@ -365,8 +407,10 @@ def load_promotion_bundle(
     files = _strict_keys(bundle["files"], file_fields, label="files")
     if bundle["campaign_id"] != campaign_id or bundle["profile_id"] != profile.base.profile_id:
         raise ValueError("promotion bundle identity mismatch")
-    if (version == 2) != bool(profile.base.observer_evaluators):
+    if (version in {2, 4}) != bool(profile.base.observer_evaluators):
         raise ValueError("promotion bundle observer protocol mismatch")
+    if (version in {3, 4}) != (profile.differential_analyzer is not None):
+        raise ValueError("promotion bundle differential protocol mismatch")
     if (
         candidate["digest"] != bundle["candidate_digest"]
         or candidate["parent_policy_digest"] != bundle["parent_policy_digest"]
@@ -402,8 +446,10 @@ def load_promotion_bundle(
     }
     if files["original_content"] is not None:
         expected_files.add("original-content.bin")
-    if version == 2:
+    if version in {2, 4}:
         expected_files.add("evaluator-agreement.json")
+    if version in {3, 4}:
+        expected_files.add("differential-analysis-summary.json")
     actual_files = {path.name for path in directory.iterdir() if path.is_file()}
     if actual_files != expected_files:
         raise ValueError("promotion bundle file set is invalid")
@@ -418,7 +464,7 @@ def load_promotion_bundle(
         (directory / "original-content.bin").read_bytes()
     ) != files["original_content"]:
         raise ValueError("promotion bundle original-content.bin digest mismatch")
-    if version == 2:
+    if version in {2, 4}:
         agreement_path = directory / "evaluator-agreement.json"
         agreement_digest = _digest(agreement_path.read_bytes())
         if (
@@ -449,6 +495,22 @@ def load_promotion_bundle(
             or agreement_report["collection_state"] != "complete"
         ):
             raise ValueError("promotion bundle agreement report identity mismatch")
+    if version in {3, 4}:
+        differential_path = directory / "differential-analysis-summary.json"
+        differential_digest = _digest(differential_path.read_bytes())
+        if (
+            differential_digest != files["differential_analysis"]
+            or differential_digest != bundle["differential_analysis_digest"]
+        ):
+            raise ValueError("promotion bundle differential summary digest mismatch")
+        from kpo.reasoning_differential import load_differential_summary
+
+        load_differential_summary(
+            directory.parents[2],
+            bundle["campaign_id"],
+            profile_snapshot_digest=bundle["profile_snapshot_digest"],
+            expected_byte_digest=bundle["differential_analysis_digest"],
+        )
     if content["original_digest"] != files["original_content"]:
         raise ValueError("promotion bundle original content digest mismatch")
     if content["reviewed_digest"] != files["reviewed_content"]:
@@ -521,7 +583,7 @@ def _validate_campaign_binding(
         "manifest_diff_digest": bundle["manifest"]["diff_digest"],
         "target_digest": bundle["target_digest"],
     }
-    if bundle["schema_version"] == 2:
+    if bundle["schema_version"] in {2, 4}:
         expected.update(
             evaluator_agreement_path=(
                 Path("campaigns") / bundle["campaign_id"] / "evaluator-agreement.json"
@@ -530,10 +592,30 @@ def _validate_campaign_binding(
         )
     if any(state.get(field) != value for field, value in expected.items()):
         raise ValueError("campaign state does not match promotion bundle")
-    if bundle["schema_version"] == 2:
+    if bundle["schema_version"] in {3, 4}:
+        expected.update(
+            differential_analysis_path=(
+                Path("campaigns")
+                / bundle["campaign_id"]
+                / "differential-analysis-summary.json"
+            ).as_posix(),
+            differential_analysis_digest=bundle["differential_analysis_digest"],
+        )
+    if any(state.get(field) != value for field, value in expected.items()):
+        raise ValueError("campaign state does not match promotion bundle")
+    if bundle["schema_version"] in {2, 4}:
         from kpo.evaluator_agreement import load_agreement_report
 
         load_agreement_report(profile, bundle["campaign_id"])
+    if bundle["schema_version"] in {3, 4}:
+        from kpo.reasoning_differential import load_differential_summary
+
+        load_differential_summary(
+            profile.base.data_home,
+            bundle["campaign_id"],
+            profile_snapshot_digest=bundle["profile_snapshot_digest"],
+            expected_byte_digest=bundle["differential_analysis_digest"],
+        )
 
 
 def resume_campaign_promotion_preview(
@@ -552,7 +634,7 @@ def resume_campaign_promotion_preview(
     ):
         raise ValueError("campaign state does not match installed promotion bundle")
     agreement_binding: dict[str, Any] = {}
-    if bundle["schema_version"] == 2:
+    if bundle["schema_version"] in {2, 4}:
         from kpo.evaluator_agreement import _validate_report_schema, agreement_summary
 
         campaign_report = (
@@ -578,6 +660,35 @@ def resume_campaign_promotion_preview(
             ).as_posix(),
             "evaluator_agreement_digest": bundle["evaluator_agreement_digest"],
             "evaluator_agreement_summary": agreement_summary(report),
+        }
+    differential_binding: dict[str, Any] = {}
+    if bundle["schema_version"] in {3, 4}:
+        from kpo.reasoning_differential import load_differential_summary
+
+        campaign_summary = (
+            profile.base.data_home
+            / "campaigns"
+            / campaign_id
+            / "differential-analysis-summary.json"
+        )
+        bundle_summary = loaded.directory / "differential-analysis-summary.json"
+        if (
+            not campaign_summary.is_file()
+            or campaign_summary.read_bytes() != bundle_summary.read_bytes()
+        ):
+            raise ValueError("installed differential summary does not match bundle")
+        summary = load_differential_summary(
+            profile.base.data_home,
+            campaign_id,
+            profile_snapshot_digest=bundle["profile_snapshot_digest"],
+            expected_byte_digest=bundle["differential_analysis_digest"],
+        )
+        differential_binding = {
+            "differential_analysis_path": campaign_summary.relative_to(
+                profile.base.data_home
+            ).as_posix(),
+            "differential_analysis_digest": bundle["differential_analysis_digest"],
+            "differential_analysis_summary": summary,
         }
     _validate_original_transaction(profile, loaded)
     budget_path = (
@@ -612,6 +723,7 @@ def resume_campaign_promotion_preview(
         ).as_posix(),
         "rejected_candidate_count": len(state.get("rejected_candidates", [])),
         **agreement_binding,
+        **differential_binding,
     }
 
 
@@ -731,10 +843,15 @@ def preview_campaign_promotion(
         "content_diff": bundle["content"]["diff"],
         "manifest_diff": bundle["manifest"]["diff"],
     }
-    if bundle["schema_version"] == 2:
+    if bundle["schema_version"] in {2, 4}:
         result.update(
             evaluator_agreement_digest=bundle["evaluator_agreement_digest"],
             evaluator_agreement_summary=state["evaluator_agreement_summary"],
+        )
+    if bundle["schema_version"] in {3, 4}:
+        result.update(
+            differential_analysis_digest=bundle["differential_analysis_digest"],
+            differential_analysis_summary=state["differential_analysis_summary"],
         )
     return result
 

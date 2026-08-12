@@ -1,8 +1,9 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.9 development milestone. KPO can reserve untouched
-> generalization cases and measure, exactly once, whether an apparently
-> improving Campaign series transfers beyond its repeatedly used holdout.
+> Status: v0.10 development milestone. KPO can identify how an Agent's
+> reasoning differs from an authorized reference analysis, turn only the safe
+> aggregate diagnosis into policy feedback, and separately test whether the
+> resulting improvement transfers to untouched cases.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -125,6 +126,15 @@ operation with an allowlist, diff, snapshot, and journal.
   Campaign partitions, diagnosis, Proposer feedback, gates, and promotion;
 - end-of-series matched initial/final policy measurement under a separate
   finite budget, with one-way consumption and aggregate holdout divergence;
+- optional train-only reasoning extraction into digest-bound claim DAGs;
+- explicit matched, contradicted, missing, surplus, and frame-divergence
+  comparisons that do not treat the reference as truth;
+- independent conclusion-validity, reasoning-fidelity, and
+  reasoning-soundness diagnoses;
+- privacy-safe differential feedback for the Proposer, with private claim
+  graphs kept out of Campaign status, series evidence, and promotion bundles;
+- finite-budget differential Providers, unavailable-evidence fallback,
+  aggregate audit summaries, and promotion/series digest binding;
 - byte-exact source and target integrity checks that avoid hashing the same
   physical file twice within one verification pass.
 
@@ -219,6 +229,49 @@ uv run kpo evaluator-agreement \
   --profile /path/outside/kpo/profile.toml \
   --campaign CAMPAIGN_ID
 ```
+
+### Compare reasoning without declaring the reference correct
+
+An optional differential analyzer examines only the train case that drives a
+policy proposal. It extracts the Agent and reference reasoning into private
+claim graphs, compares their structure, and produces three independent
+diagnoses: whether the conclusion is supported, whether the reasoning resembles
+the reference, and whether the Agent's own chain is sound.
+
+```toml
+[differential_analyzer.extractor]
+adapter = "command"
+command = ["./bin/reasoning-extractor"]
+model_id = "extractor-v1"
+timeout_seconds = 30
+pass_env = []
+
+[differential_analyzer.differ]
+adapter = "command"
+command = ["./bin/claim-differ"]
+model_id = "differ-v1"
+timeout_seconds = 30
+pass_env = []
+
+[differential_analyzer.diagnostician]
+adapter = "command"
+command = ["./bin/differential-diagnostician"]
+model_id = "diagnostician-v1"
+timeout_seconds = 30
+pass_env = []
+```
+
+All three Providers are required together and share the Campaign's existing
+call budget. A failed differential call is recorded as unavailable evidence;
+it cannot fabricate an empty success or bypass the ordinary validation and
+regression gates. Validation, holdout, regression, calibration, and untouched
+generalization cases never enter these requests.
+
+Only abstract axes and gap categories may reach the Proposer. Raw claim text,
+reference prose, citations, and graph edges remain private runtime evidence.
+The aggregate summary is bound into Campaign series evidence and any promotion
+preview, so reviewers can detect missing or changed analysis without exposing
+the underlying source material.
 
 ## Audit Evaluator calibration and drift
 
@@ -382,6 +435,8 @@ The approval digest binds the candidate, report and policy digests, both
 relative paths, exact original/reviewed bytes, and both displayed diffs. When
 observer Evaluators are configured, it also binds the exact aggregate
 agreement-report bytes. KPO never infers this value for a real profile.
+When differential analysis is configured, the approval also binds its exact
+privacy-safe aggregate summary bytes.
 Recovery restores an interrupted prepared transaction; it does not roll back a
 committed promotion.
 
@@ -419,3 +474,4 @@ Approved specifications:
 - [v0.7 Evaluator calibration and drift](docs/specs/0007-evaluator-calibration-and-drift.md)
 - [v0.8 Campaign series orchestration](docs/specs/0008-campaign-series-orchestration.md)
 - [v0.9 untouched generalization measurement](docs/specs/0009-untouched-generalization-measurement.md)
+- [v0.10 reference reasoning differential](docs/specs/0010-reference-reasoning-differential.md)

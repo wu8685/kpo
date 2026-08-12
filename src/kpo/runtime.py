@@ -18,6 +18,7 @@ class RunState(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    EVALUATION_FAILED = "evaluation_failed"
     FAILED = "failed"
     EVALUATED = "evaluated"
     DIAGNOSED = "diagnosed"
@@ -30,7 +31,10 @@ class RunState(str, Enum):
 _ALLOWED_TRANSITIONS: dict[RunState, frozenset[RunState]] = {
     RunState.PENDING: frozenset({RunState.RUNNING, RunState.FAILED}),
     RunState.RUNNING: frozenset({RunState.COMPLETED, RunState.FAILED}),
-    RunState.COMPLETED: frozenset({RunState.EVALUATED, RunState.FAILED}),
+    RunState.COMPLETED: frozenset(
+        {RunState.EVALUATED, RunState.EVALUATION_FAILED, RunState.FAILED}
+    ),
+    RunState.EVALUATION_FAILED: frozenset({RunState.EVALUATED, RunState.FAILED}),
     RunState.EVALUATED: frozenset({RunState.DIAGNOSED, RunState.FAILED}),
     RunState.DIAGNOSED: frozenset({RunState.CANDIDATE, RunState.FAILED}),
     RunState.CANDIDATE: frozenset({RunState.REGRESSED, RunState.FAILED}),

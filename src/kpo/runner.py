@@ -100,6 +100,29 @@ def _rollout(value: str) -> Rollout:
     )
 
 
+def _validate_rollout_identity(
+    rollout: Rollout, record: Any, profile: ExternalProfile
+) -> None:
+    if record.policy_digest != profile.policy.digest:
+        raise ValueError("run policy digest mismatch")
+    if record.case_id not in profile.cases:
+        raise ValueError("run case ID mismatch")
+    if rollout.case_id != record.case_id:
+        raise ValueError("rollout case ID mismatch")
+    if rollout.policy_digest != record.policy_digest:
+        raise ValueError("rollout policy digest mismatch")
+    expected = Rollout.create(
+        case_id=rollout.case_id,
+        policy_digest=rollout.policy_digest,
+        model_id=rollout.model_id,
+        output=rollout.output,
+        retrieved_policy_ids=rollout.retrieved_policy_ids,
+        actor_payload_digest=rollout.actor_payload_digest,
+    )
+    if rollout.digest != expected.digest:
+        raise ValueError("rollout digest mismatch")
+
+
 def evaluate_profile_run(
     profile_path: Path, run_id: str, *, checkout: Path
 ) -> dict[str, Any]:
@@ -114,15 +137,20 @@ def evaluate_profile_run(
     )
     store = RuntimeStore(profile.data_home)
     record = store.get_run(run_id)
-    if record.state is not RunState.COMPLETED:
-        raise ValueError("run must be completed before evaluation")
     links = store.run_artifacts(run_id)
+    if record.state not in {
+        RunState.COMPLETED,
+        RunState.EVALUATION_FAILED,
+    }:
+        raise ValueError("run must have a completed rollout before evaluation")
     recorded_sources = json.loads(store.read_artifact(links["source_digests"]))
     if recorded_sources != dict(profile.source_digests):
         raise ValueError("source drift detected between run and evaluate")
     if record.profile_digest != _profile_digest(profile):
         raise ValueError("profile drift detected between run and evaluate")
     rollout = _rollout(store.read_artifact(links["rollout"]))
+    _validate_rollout_identity(rollout, record, profile)
+    monitor.verify()
     case = profile.cases[record.case_id]
     references = tuple(profile.references[item] for item in case.hidden_reference_ids)
     try:
@@ -135,7 +163,11 @@ def evaluate_profile_run(
             rubric_version=profile.rubric.rubric_version,
         )
         monitor.verify()
-    except (ProviderFailure, IntegrityViolation):
+    except ProviderFailure:
+        if record.state is RunState.COMPLETED:
+            store.transition_run(run_id, RunState.EVALUATION_FAILED)
+        raise
+    except IntegrityViolation:
         store.transition_run(run_id, RunState.FAILED)
         raise
     artifact = store.put_artifact("evaluation", canonical_json(evaluation))

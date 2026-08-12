@@ -1,9 +1,9 @@
 # KPO — Knowledge Policy Optimization
 
-> Status: v0.10 development milestone. KPO can identify how an Agent's
-> reasoning differs from an authorized reference analysis, turn only the safe
-> aggregate diagnosis into policy feedback, and separately test whether the
-> resulting improvement transfers to untouched cases.
+> Status: v0.11 development milestone. KPO can identify how an Agent's
+> reasoning differs from an authorized reference analysis, use the aggregate
+> gaps to select externally prepared train cases, and separately test whether
+> the resulting improvement transfers to untouched cases.
 
 KPO is a framework for improving the **external knowledge policy** used by an
 Agent without modifying the underlying model weights.
@@ -135,6 +135,12 @@ operation with an allowlist, diff, snapshot, and journal.
   graphs kept out of Campaign status, series evidence, and promotion bundles;
 - finite-budget differential Providers, unavailable-evidence fallback,
   aggregate audit summaries, and promotion/series digest binding;
+- deterministic, metadata-only curriculum selection driven by actionable
+  differential counts, with no Provider calls during selection;
+- closed candidate-facet registries, all-partition and untouched-generalization
+  contamination checks, immutable private plans, and train-only growth;
+- nested digest approval and operation-specific recovery for curriculum-driven
+  dataset transactions;
 - byte-exact source and target integrity checks that avoid hashing the same
   physical file twice within one verification pass.
 
@@ -366,6 +372,50 @@ history. `series reconcile` repairs a verified terminal-state/append crash gap
 without Provider calls. Quality indicators are advisory; `max_campaigns` and
 an explicit owner stop are enforced before new Provider work.
 
+### Select train cases from observed reasoning gaps
+
+An optional curriculum section ranks externally prepared candidate cases using
+the latest strictly bound differential summary in an active series:
+
+```toml
+[curriculum]
+inbox = "./candidate-inbox.jsonl"
+max_selection = 8
+diversity_weight = 0.30
+allowed_facets = ["boundary", "causal-order", "counterfactual"]
+```
+
+Each inbox row names an existing case plus actionable gap kinds, declared
+facets, and provenance. It contains no prompt, context, reference, partition,
+weight, or Provider-generated score. KPO obtains case content from the external
+case manifest, rejects overlap with every Campaign partition and untouched
+generalization, and constructs selected rows internally as train-only data.
+
+```bash
+# Persist an immutable private proposal; the external dataset is unchanged.
+uv run kpo curriculum select \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID
+
+# Apply exactly the reviewed selection and nested dataset-growth transaction.
+uv run kpo curriculum select \
+  --profile /path/outside/kpo/profile.toml \
+  --series SERIES_ID \
+  --approve APPROVAL_DIGEST
+
+# Recover only a matching interrupted curriculum apply.
+uv run kpo curriculum recover \
+  --profile /path/outside/kpo/profile.toml \
+  --approval APPROVAL_DIGEST
+```
+
+Selection is deterministic and makes zero Actor, Evaluator, Proposer, or
+differential Provider calls. It is a hypothesis about which train cases may
+help, not evidence that they will. The next Campaign must test the result. If
+the source Campaign also has a policy promotion preview, apply or reject that
+promotion before growing the dataset; changing the dataset intentionally makes
+an unconsumed promotion snapshot stale.
+
 ### Measure untouched generalization once
 
 An optional generalization manifest is frozen with the series but never used
@@ -475,3 +525,4 @@ Approved specifications:
 - [v0.8 Campaign series orchestration](docs/specs/0008-campaign-series-orchestration.md)
 - [v0.9 untouched generalization measurement](docs/specs/0009-untouched-generalization-measurement.md)
 - [v0.10 reference reasoning differential](docs/specs/0010-reference-reasoning-differential.md)
+- [v0.11 differential-guided curriculum](docs/specs/0011-curriculum-dataset-growth.md)

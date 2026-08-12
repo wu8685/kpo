@@ -227,6 +227,8 @@ def series_mutation(
     series_index: int | None = None,
     revision: int | None = None,
     initial_state_digest: str | None = None,
+    approval_digest: str | None = None,
+    growth_approval_digest: str | None = None,
 ) -> Iterator[Callable[..., None]]:
     path = _series_lock_path(profile, series_id)
     record = {
@@ -239,6 +241,10 @@ def series_mutation(
         "initial_state_digest": initial_state_digest,
         "pid": os.getpid(),
     }
+    if approval_digest is not None:
+        record["approval_digest"] = approval_digest
+    if growth_approval_digest is not None:
+        record["growth_approval_digest"] = growth_approval_digest
     try:
         _atomic_new_json(path, record)
     except FileExistsError as error:
@@ -376,6 +382,15 @@ def build_series_contract(profile: CampaignProfile) -> SeriesContract:
             "extractor": differential_provider(analyzer.extractor),
             "differ": differential_provider(analyzer.differ),
             "diagnostician": differential_provider(analyzer.diagnostician),
+        }
+    if profile.curriculum is not None:
+        components["curriculum"] = {
+            "protocol": "kpo.curriculum-selection/v1",
+            "max_selection": profile.curriculum.max_selection,
+            "diversity_weight": profile.curriculum.diversity_weight,
+            "facet_registry_digest": canonical_digest(
+                profile.curriculum.allowed_facets
+            ),
         }
     return SeriesContract(
         components=components,
@@ -866,6 +881,7 @@ _LOCK_FIELDS = {
     "initial_state_digest",
     "pid",
 }
+_CURRICULUM_LOCK_FIELDS = {"approval_digest", "growth_approval_digest"}
 
 
 def _process_is_alive(pid: Any) -> bool:
@@ -890,7 +906,13 @@ def _recover_stale_series_lock(
         raw = json.loads(lock_path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("series manual recovery required") from error
-    lock = _strict(raw, _LOCK_FIELDS, "campaign series lock")
+    if (
+        not isinstance(raw, dict)
+        or not _LOCK_FIELDS.issubset(raw)
+        or set(raw) - _LOCK_FIELDS - _CURRICULUM_LOCK_FIELDS
+    ):
+        raise ValueError("invalid campaign series lock fields")
+    lock = raw
     if (
         lock["protocol"] != "kpo.campaign-series-lock/v1"
         or lock["series_id"] != series_id
@@ -899,6 +921,31 @@ def _recover_stale_series_lock(
     if _process_is_alive(lock["pid"]):
         raise ValueError("series concurrent mutation")
     operation = lock["operation"]
+    curriculum_fields = set(lock) & _CURRICULUM_LOCK_FIELDS
+    if operation == "curriculum_preview":
+        if curriculum_fields:
+            raise ValueError("series manual recovery required")
+        state = load_series_state(profile, series_id)
+        if (
+            not _valid_digest(lock["initial_state_digest"])
+            or state["state_digest"] != lock["initial_state_digest"]
+        ):
+            raise ValueError("series manual recovery required")
+        lock_path.unlink()
+        return
+    if operation == "curriculum_apply":
+        if (
+            "approval_digest" not in curriculum_fields
+            or not _valid_digest(lock["approval_digest"])
+            or (
+                "growth_approval_digest" in curriculum_fields
+                and not _valid_digest(lock["growth_approval_digest"])
+            )
+        ):
+            raise ValueError("series manual recovery required")
+        raise ValueError("series manual recovery required")
+    if curriculum_fields:
+        raise ValueError("series manual recovery required")
     if operation == "append":
         state = load_series_state(profile, series_id)
         attached = any(

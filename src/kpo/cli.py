@@ -17,6 +17,11 @@ from kpo.campaign_series import (
     series_status,
     stop_series,
 )
+from kpo.curriculum import (
+    apply_curriculum,
+    preview_curriculum,
+    recover_curriculum,
+)
 from kpo.dataset import DatasetManager, load_dataset
 from kpo.demo import run_synthetic_demo
 from kpo.evaluator_agreement import load_agreement_report
@@ -116,6 +121,22 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--checkout", type=Path, default=Path.cwd())
         if name == "evidence":
             command.add_argument("--full", action="store_true")
+    curriculum = subcommands.add_parser(
+        "curriculum",
+        help="select, apply, or recover differential-guided dataset growth",
+    )
+    curriculum_commands = curriculum.add_subparsers(
+        dest="curriculum_command", required=True
+    )
+    curriculum_select = curriculum_commands.add_parser("select")
+    curriculum_select.add_argument("--profile", type=Path, required=True)
+    curriculum_select.add_argument("--series", required=True)
+    curriculum_select.add_argument("--approve")
+    curriculum_select.add_argument("--checkout", type=Path, default=Path.cwd())
+    curriculum_recover = curriculum_commands.add_parser("recover")
+    curriculum_recover.add_argument("--profile", type=Path, required=True)
+    curriculum_recover.add_argument("--approval", required=True)
+    curriculum_recover.add_argument("--checkout", type=Path, default=Path.cwd())
     campaign_status_parser = subcommands.add_parser(
         "campaign-status", help="inspect a campaign"
     )
@@ -190,6 +211,55 @@ def main(argv: Sequence[str] | None = None) -> int:
                 checkout=args.checkout,
                 approval_digest=args.approve,
             )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if args.command == "curriculum":
+        profile = load_campaign_profile(args.profile, checkout=args.checkout)
+        if args.curriculum_command == "recover":
+            recovered = recover_curriculum(
+                profile, approval_digest=args.approval
+            )
+            result = {
+                "state": recovered.state,
+                "approval_digest": args.approval,
+                "growth_approval_digest": recovered.approval_digest,
+                "journal_path": str(recovered.journal_path),
+            }
+        elif args.approve is not None:
+            applied = apply_curriculum(
+                profile,
+                args.series,
+                approval_digest=args.approve,
+            )
+            result = {
+                "state": applied.state,
+                "approval_digest": args.approve,
+                "growth_approval_digest": applied.approval_digest,
+                "journal_path": str(applied.journal_path),
+            }
+        else:
+            preview = preview_curriculum(profile, args.series)
+            result = {
+                "state": "preview",
+                "approval_digest": preview.plan.approval_digest,
+                "selected_case_ids": preview.plan.selected_case_ids,
+                "selected_steps": [
+                    {
+                        "case_id": step.case_id,
+                        "relevance": step.relevance,
+                        "diversity": step.diversity,
+                        "score": step.score,
+                    }
+                    for step in preview.plan.selected_steps
+                ],
+                "selected_gap_coverage": dict(
+                    preview.plan.selected_gap_coverage
+                ),
+                "current_dataset_digest": preview.plan.current_dataset_digest,
+                "proposed_dataset_digest": (
+                    preview.plan.proposed_dataset_record_digest
+                ),
+            }
         print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
         return 0
     if args.command == "series":

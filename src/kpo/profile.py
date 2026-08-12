@@ -197,6 +197,7 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
             "sandbox",
             "series",
             "differential_analyzer",
+            "curriculum",
         },
         label="profile",
     )

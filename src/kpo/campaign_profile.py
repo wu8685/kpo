@@ -52,6 +52,14 @@ class DifferentialAnalyzerConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class CurriculumConfig:
+    inbox: Path
+    max_selection: int
+    diversity_weight: float
+    allowed_facets: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CampaignProfile:
     base: ExternalProfile
     dataset: DatasetManifest
@@ -71,6 +79,7 @@ class CampaignProfile:
     series: SeriesConfig | None
     generalization: GeneralizationConfig | None
     differential_analyzer: DifferentialAnalyzerConfig | None
+    curriculum: CurriculumConfig | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +142,15 @@ def campaign_profile_snapshot(profile: CampaignProfile) -> str:
             "max_provider_calls": profile.evaluator_audit.max_provider_calls,
             "drift_thresholds": profile.evaluator_audit.drift_thresholds,
             "source_digests": profile.evaluator_audit.source_digests,
+        }
+    if profile.curriculum is not None:
+        snapshot["curriculum"] = {
+            "protocol": "kpo.curriculum-selection/v1",
+            "max_selection": profile.curriculum.max_selection,
+            "diversity_weight": profile.curriculum.diversity_weight,
+            "facet_registry_digest": canonical_digest(
+                profile.curriculum.allowed_facets
+            ),
         }
     return canonical_digest(snapshot)
 
@@ -228,6 +246,64 @@ def _unit_float(value: object, label: str) -> float:
     ):
         raise ValueError(f"{label} must be finite and between zero and one")
     return float(value)
+
+
+def _normalized(value: str) -> str:
+    return " ".join(value.casefold().split())
+
+
+def _curriculum_config(
+    raw: object,
+    *,
+    root: Path,
+    series: SeriesConfig | None,
+    differential_analyzer: DifferentialAnalyzerConfig | None,
+) -> CurriculumConfig | None:
+    if raw is None:
+        return None
+    section = _strict(
+        raw,
+        {"inbox", "max_selection", "diversity_weight", "allowed_facets"},
+        label="curriculum",
+    )
+    if set(section) != {
+        "inbox",
+        "max_selection",
+        "diversity_weight",
+        "allowed_facets",
+    }:
+        raise ValueError("curriculum fields are required")
+    if series is None:
+        raise ValueError("curriculum requires series configuration")
+    if differential_analyzer is None:
+        raise ValueError("curriculum requires differential_analyzer configuration")
+    raw_facets = section["allowed_facets"]
+    if (
+        not isinstance(raw_facets, list)
+        or not raw_facets
+        or any(
+            not isinstance(facet, str) or not facet.strip()
+            for facet in raw_facets
+        )
+    ):
+        raise ValueError(
+            "curriculum.allowed_facets must be a non-empty string array"
+        )
+    facets = tuple(_normalized(facet) for facet in raw_facets)
+    if any(raw_facet != facet for raw_facet, facet in zip(raw_facets, facets)):
+        raise ValueError("curriculum.allowed_facets values must already be normalized")
+    if len(set(facets)) != len(facets):
+        raise ValueError("curriculum.allowed_facets values must be unique")
+    return CurriculumConfig(
+        inbox=_source_path(root, section["inbox"], label="curriculum.inbox"),
+        max_selection=_positive_integer(
+            section["max_selection"], "curriculum.max_selection"
+        ),
+        diversity_weight=_unit_float(
+            section["diversity_weight"], "curriculum.diversity_weight"
+        ),
+        allowed_facets=facets,
+    )
 
 
 def _series_config(raw: object) -> SeriesConfig | None:
@@ -448,6 +524,12 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
     differential_analyzer = _differential_analyzer_config(
         raw.get("differential_analyzer"), root=root, base=base
     )
+    curriculum = _curriculum_config(
+        raw.get("curriculum"),
+        root=root,
+        series=series,
+        differential_analyzer=differential_analyzer,
+    )
     return CampaignProfile(
         base=base,
         dataset=dataset,
@@ -469,6 +551,7 @@ def load_campaign_profile(profile_path: Path, *, checkout: Path) -> CampaignProf
         series=series,
         generalization=generalization,
         differential_analyzer=differential_analyzer,
+        curriculum=curriculum,
     )
 
 

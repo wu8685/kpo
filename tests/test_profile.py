@@ -117,6 +117,98 @@ def test_profile_loads_relative_to_profile_not_working_directory(
     assert loaded.references["ref-1"].content == "State uncertainty.\n"
     assert loaded.rubric.dimension_names == ("alignment",)
     assert not loaded.data_home.exists()
+    assert loaded.feedback_optimization is None
+
+
+def _append_feedback_optimization(profile_path: Path) -> None:
+    with profile_path.open("a", encoding="utf-8") as stream:
+        stream.write(
+            '''
+[feedback_optimization]
+ambiguity_margin = 0.15
+max_component_candidates = 4
+max_consecutive_rejections = 2
+enabled_targets = ["knowledge_policy", "evaluator"]
+
+[feedback_optimization.gates.knowledge_policy]
+hard = ["validation_non_degradation", "holdout_non_degradation"]
+advisory = ["confirmed_gap_delta"]
+
+[feedback_optimization.gates.evaluator]
+hard = ["independent_calibration", "repeatability_non_degradation"]
+advisory = ["agreement_delta", "provider_call_delta"]
+'''
+        )
+
+
+def test_profile_loads_sealed_feedback_optimization_contract(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path / "feedback")
+    _append_feedback_optimization(profile_path)
+
+    loaded = load_profile(profile_path, checkout=Path(__file__).parents[1])
+
+    assert loaded.feedback_optimization is not None
+    assert loaded.feedback_optimization.ambiguity_margin == 0.15
+    assert tuple(
+        target.value for target in loaded.feedback_optimization.enabled_targets
+    ) == ("evaluator", "knowledge_policy")
+    assert loaded.feedback_optimization.gates["evaluator"].advisory == (
+        "agreement_delta",
+        "provider_call_delta",
+    )
+
+
+def test_profile_rejects_feedback_agreement_as_hard_gate(tmp_path: Path) -> None:
+    profile_path = _write_profile(tmp_path / "feedback-hard-agreement")
+    _append_feedback_optimization(profile_path)
+    text = profile_path.read_text(encoding="utf-8").replace(
+        'hard = ["independent_calibration", "repeatability_non_degradation"]',
+        'hard = ["agreement_delta"]',
+    )
+    profile_path.write_text(text, encoding="utf-8")
+
+    with pytest.raises(ValueError, match="agreement_delta.*advisory"):
+        load_profile(profile_path, checkout=Path(__file__).parents[1])
+
+
+def test_profile_rejects_missing_or_unknown_feedback_target_gate(
+    tmp_path: Path,
+) -> None:
+    missing_path = _write_profile(tmp_path / "feedback-missing-gate")
+    _append_feedback_optimization(missing_path)
+    text = missing_path.read_text(encoding="utf-8").replace(
+        ', "evaluator"', ""
+    )
+    missing_path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="gate.*disabled target"):
+        load_profile(missing_path, checkout=Path(__file__).parents[1])
+
+    unknown_path = _write_profile(tmp_path / "feedback-unknown-target")
+    _append_feedback_optimization(unknown_path)
+    text = unknown_path.read_text(encoding="utf-8").replace(
+        '"evaluator"]', '"unknown"]'
+    )
+    unknown_path.write_text(text, encoding="utf-8")
+    with pytest.raises(ValueError, match="unknown optimization target"):
+        load_profile(unknown_path, checkout=Path(__file__).parents[1])
+
+
+def test_profile_requires_knowledge_policy_when_feedback_is_enabled(
+    tmp_path: Path,
+) -> None:
+    profile_path = _write_profile(tmp_path / "feedback-without-policy-target")
+    _append_feedback_optimization(profile_path)
+    text = profile_path.read_text(encoding="utf-8")
+    text = text.replace(
+        'enabled_targets = ["knowledge_policy", "evaluator"]',
+        'enabled_targets = ["evaluator"]',
+    )
+    start = text.index("[feedback_optimization.gates.knowledge_policy]")
+    end = text.index("[feedback_optimization.gates.evaluator]")
+    profile_path.write_text(text[:start] + text[end:], encoding="utf-8")
+
+    with pytest.raises(ValueError, match="knowledge_policy"):
+        load_profile(profile_path, checkout=Path(__file__).parents[1])
 
 
 @pytest.mark.parametrize("schema_version", [0, 2])

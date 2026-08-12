@@ -13,6 +13,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from kpo.feedback_optimization import OptimizationTarget
 from kpo.models import PolicyArtifact, PolicySnapshot, ReferenceArtifact, TaskCase
 
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -52,6 +53,21 @@ class ObserverEvaluatorConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class FeedbackOptimizationGate:
+    hard: tuple[str, ...]
+    advisory: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FeedbackOptimizationConfig:
+    ambiguity_margin: float
+    max_component_candidates: int
+    max_consecutive_rejections: int
+    enabled_targets: tuple[OptimizationTarget, ...]
+    gates: Mapping[str, FeedbackOptimizationGate]
+
+
+@dataclass(frozen=True, slots=True)
 class ExternalProfile:
     path: Path
     profile_id: str
@@ -64,7 +80,87 @@ class ExternalProfile:
     actor: CommandProviderConfig
     evaluator: CommandProviderConfig
     observer_evaluators: tuple[ObserverEvaluatorConfig, ...]
+    feedback_optimization: FeedbackOptimizationConfig | None
     source_digests: Mapping[str, str]
+
+
+_FEEDBACK_METRICS: dict[OptimizationTarget, frozenset[str]] = {
+    OptimizationTarget.KNOWLEDGE_POLICY: frozenset(
+        {
+            "confirmed_gap_delta",
+            "validation_non_degradation",
+            "holdout_non_degradation",
+            "regression_non_degradation",
+            "unsupported_claim_non_degradation",
+            "boundary_violation_non_degradation",
+        }
+    ),
+    OptimizationTarget.RETRIEVAL: frozenset(
+        {
+            "retrieval_recall_delta",
+            "retrieval_precision_non_degradation",
+            "actor_outcome_non_degradation",
+            "context_budget_non_increase",
+        }
+    ),
+    OptimizationTarget.ACTOR: frozenset(
+        {
+            "semantic_outcome_delta",
+            "unsupported_claim_non_degradation",
+            "instruction_compliance_delta",
+        }
+    ),
+    OptimizationTarget.EVALUATOR: frozenset(
+        {
+            "independent_calibration",
+            "repeatability_non_degradation",
+            "agreement_delta",
+            "discrimination_delta",
+            "provider_call_delta",
+        }
+    ),
+    OptimizationTarget.RUBRIC: frozenset(
+        {
+            "dimension_isolation",
+            "independent_outcome_validity",
+            "agreement_non_degradation",
+            "discrimination_delta",
+        }
+    ),
+    OptimizationTarget.PROPOSER: frozenset(
+        {
+            "accepted_patch_delta",
+            "validation_outcome_non_degradation",
+            "patch_size_non_increase",
+            "regression_non_degradation",
+        }
+    ),
+    OptimizationTarget.DATASET: frozenset(
+        {
+            "coverage_delta",
+            "label_review_pass",
+            "reference_review_pass",
+            "contamination_absent",
+        }
+    ),
+    OptimizationTarget.ORCHESTRATION: frozenset(
+        {
+            "semantic_outcome_non_degradation",
+            "provider_call_delta",
+            "cost_delta",
+            "latency_delta",
+            "failure_rate_non_degradation",
+        }
+    ),
+    OptimizationTarget.RUNTIME: frozenset(
+        {
+            "integrity_pass",
+            "recovery_pass",
+            "failure_rate_non_degradation",
+            "semantic_bytes_unchanged",
+        }
+    ),
+}
 
 
 def _strict(value: Any, allowed: set[str], *, label: str) -> dict[str, Any]:
@@ -169,6 +265,105 @@ def _digest_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _feedback_optimization(raw: Any) -> FeedbackOptimizationConfig | None:
+    if raw is None:
+        return None
+    data = _strict(
+        raw,
+        {
+            "ambiguity_margin",
+            "max_component_candidates",
+            "max_consecutive_rejections",
+            "enabled_targets",
+            "gates",
+        },
+        label="feedback_optimization",
+    )
+    margin = data.get("ambiguity_margin")
+    if (
+        not isinstance(margin, (int, float))
+        or isinstance(margin, bool)
+        or not math.isfinite(margin)
+        or not 0 <= margin <= 1
+    ):
+        raise ValueError("feedback_optimization.ambiguity_margin must be in [0, 1]")
+    positive: dict[str, int] = {}
+    for field in ("max_component_candidates", "max_consecutive_rejections"):
+        value = data.get(field)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ValueError(f"feedback_optimization.{field} must be positive")
+        positive[field] = value
+
+    raw_targets = data.get("enabled_targets")
+    if not isinstance(raw_targets, list) or not raw_targets:
+        raise ValueError("feedback_optimization.enabled_targets must not be empty")
+    targets: list[OptimizationTarget] = []
+    for value in raw_targets:
+        if not isinstance(value, str):
+            raise ValueError("feedback optimization target must be a string")
+        try:
+            target = OptimizationTarget(value)
+        except ValueError as error:
+            raise ValueError(f"unknown optimization target: {value}") from error
+        targets.append(target)
+    if len(set(targets)) != len(targets):
+        raise ValueError("duplicate feedback optimization target")
+    if OptimizationTarget.KNOWLEDGE_POLICY not in targets:
+        raise ValueError(
+            "feedback optimization requires knowledge_policy for legacy routing"
+        )
+
+    raw_gates = _strict(data.get("gates"), set(item.value for item in OptimizationTarget), label="feedback optimization gates")
+    target_names = {target.value for target in targets}
+    gate_names = set(raw_gates)
+    extra = gate_names - target_names
+    if extra:
+        raise ValueError(f"feedback gate configured for disabled target: {sorted(extra)}")
+    missing = target_names - gate_names
+    if missing:
+        raise ValueError(f"missing feedback target gate: {sorted(missing)}")
+
+    gates: dict[str, FeedbackOptimizationGate] = {}
+    for target in targets:
+        gate = _strict(
+            raw_gates[target.value],
+            {"hard", "advisory"},
+            label=f"feedback gate {target.value}",
+        )
+        hard = gate.get("hard")
+        advisory = gate.get("advisory")
+        if not isinstance(hard, list) or not hard or any(
+            not isinstance(item, str) or not item for item in hard
+        ):
+            raise ValueError(f"feedback gate {target.value}.hard must not be empty")
+        if not isinstance(advisory, list) or any(
+            not isinstance(item, str) or not item for item in advisory
+        ):
+            raise ValueError(f"feedback gate {target.value}.advisory must be an array")
+        if len(set(hard)) != len(hard) or len(set(advisory)) != len(advisory):
+            raise ValueError(f"feedback gate {target.value} contains duplicate metrics")
+        if "agreement_delta" in hard:
+            raise ValueError("agreement_delta is advisory-only")
+        if set(hard) & set(advisory):
+            raise ValueError(f"feedback gate {target.value} metrics overlap")
+        unknown = (set(hard) | set(advisory)) - _FEEDBACK_METRICS[target]
+        if unknown:
+            raise ValueError(
+                f"unknown feedback metrics for {target.value}: {sorted(unknown)}"
+            )
+        gates[target.value] = FeedbackOptimizationGate(
+            hard=tuple(hard), advisory=tuple(advisory)
+        )
+
+    return FeedbackOptimizationConfig(
+        ambiguity_margin=float(margin),
+        max_component_candidates=positive["max_component_candidates"],
+        max_consecutive_rejections=positive["max_consecutive_rejections"],
+        enabled_targets=tuple(sorted(targets, key=lambda item: item.value)),
+        gates=MappingProxyType(dict(sorted(gates.items()))),
+    )
+
+
 def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
     checkout_root = checkout.expanduser().resolve()
     path = profile_path.expanduser().resolve(strict=True)
@@ -198,12 +393,16 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
             "series",
             "differential_analyzer",
             "curriculum",
+            "feedback_optimization",
         },
         label="profile",
     )
     if data.get("schema_version") != 1:
         raise ValueError("profile schema_version must be 1")
     profile_id = _require_string(data.get("profile_id"), label="profile_id")
+    feedback_optimization = _feedback_optimization(
+        data.get("feedback_optimization")
+    )
 
     section_paths: dict[str, Path] = {}
     for section, key in (
@@ -439,5 +638,6 @@ def load_profile(profile_path: Path, *, checkout: Path) -> ExternalProfile:
         actor=actor,
         evaluator=evaluator,
         observer_evaluators=tuple(observers),
+        feedback_optimization=feedback_optimization,
         source_digests=digests,
     )
